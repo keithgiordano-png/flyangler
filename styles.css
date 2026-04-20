@@ -168,6 +168,21 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 }
 .fab.fab-camera svg { display:block; }
 
+/* Recenter-on-my-location FAB — mirrors the pin-drop FAB on the opposite
+   side of the screen so both core actions (drop-a-pin, find-me-again)
+   are always thumb-reachable. 50px circle, white w/ brand-green icon so
+   it stands out against both street and satellite maps. */
+.fab.fab-recenter {
+  left:16px;
+  right:auto;
+  bottom:90px;
+  width:50px;
+  height:50px;
+  background:#fff;
+  color:var(--brand);
+}
+.fab.fab-recenter svg { display:block; }
+
 .fab.cancel { background:var(--danger); color:white; }
 
 /* ─── Bottom Nav ─── */
@@ -290,6 +305,158 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .pin-list-info { flex:1; min-width:0; }
 .pin-list-info h4 { font-size:14px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .pin-list-info p { font-size:12px; color:var(--muted); margin-top:2px; }
+
+/* Pin-list photo thumbnail — shows the first catch photo when available,
+   fallback to a fishing-rod emoji otherwise. Background-image so we can
+   swap it in asynchronously without reflowing the list. */
+.pin-list-thumb {
+  width:48px;
+  height:48px;
+  border-radius:10px;
+  background:var(--accent);
+  background-size:cover;
+  background-position:center;
+  flex-shrink:0;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:20px;
+  overflow:hidden;
+}
+.pin-list-thumb.has-photo { background-color:#ddd; }
+.pin-list-thumb.has-photo span { display:none; }
+
+/* Search + sort header above the pin list */
+.pin-list-controls {
+  display:flex;
+  gap:8px;
+  margin-bottom:10px;
+}
+.pin-list-controls .pin-list-search {
+  flex:1;
+  padding:10px 12px;
+  border:1px solid #d4d4d4;
+  border-radius:10px;
+  font-size:16px;   /* 16px prevents iOS auto-zoom */
+  background:#fff;
+  min-width:0;
+}
+.pin-list-controls .pin-list-sort {
+  padding:10px 12px;
+  border:1px solid #d4d4d4;
+  border-radius:10px;
+  font-size:14px;
+  background:#fff;
+  flex-shrink:0;
+  max-width:40%;
+}
+
+/* Hatch Calendar modal — month nav + hatch rows */
+.hatch-month-nav {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:12px;
+  padding:4px 0;
+}
+.hatch-month-btn {
+  width:40px;
+  height:40px;
+  border:1px solid #d4d4d4;
+  border-radius:50%;
+  background:#fff;
+  font-size:22px;
+  font-weight:700;
+  color:var(--brand);
+  cursor:pointer;
+  line-height:1;
+}
+.hatch-month-btn:active { background:var(--bg); }
+.hatch-month-label {
+  font-size:18px;
+  font-weight:700;
+  color:var(--text);
+}
+.hatch-row {
+  background:var(--bg);
+  border-radius:12px;
+  padding:12px;
+  margin-bottom:10px;
+}
+.hatch-row-head { margin-bottom:6px; font-size:15px; color:var(--text); }
+.hatch-flies {
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  margin-bottom:6px;
+}
+.hatch-fly-chip {
+  background:#fff;
+  border:1px solid #d4d4d4;
+  border-radius:14px;
+  padding:4px 10px;
+  font-size:12px;
+  color:var(--text);
+}
+.hatch-notes {
+  font-size:12px;
+  color:var(--muted);
+  line-height:1.4;
+}
+
+/* Fly-suggestion chips — appear under an empty Fly input on each catch */
+.fly-suggestions {
+  margin-top:6px;
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  align-items:center;
+}
+.fly-suggestions:empty { display:none; }
+.fly-suggest-label {
+  font-size:11px;
+  color:var(--muted);
+  text-transform:uppercase;
+  letter-spacing:0.5px;
+  margin-right:4px;
+}
+.fly-suggest-chip {
+  background:#f5efe2;
+  border:1px solid #e5d9bd;
+  border-radius:14px;
+  padding:4px 10px;
+  font-size:12px;
+  color:var(--text);
+  cursor:pointer;
+}
+.fly-suggest-chip:hover { background:var(--accent); }
+.fly-suggest-chip:active { transform:scale(0.97); }
+
+/* Historical flow context — "140% of median for this date" line below
+   the flow badge. Color shifts warn when flow is really high or low. */
+.pin-flow-context {
+  margin-top:6px;
+  font-size:12px;
+  color:var(--muted);
+  line-height:1.35;
+}
+.flow-ctx-label {
+  display:inline-block;
+  padding:1px 8px;
+  border-radius:10px;
+  font-size:11px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:0.3px;
+  background:#e5e5e5;
+  color:var(--text);
+}
+.flow-ctx-very-low   { background:#ffe6b8; color:#8a5a00; }
+.flow-ctx-below-normal { background:#fff1cc; color:#8a5a00; }
+.flow-ctx-normal     { background:#d9f2d9; color:#1c5c1c; }
+.flow-ctx-above-normal { background:#fde2c9; color:#a15a14; }
+.flow-ctx-high       { background:#ffd5cc; color:#8a2a14; }
+.flow-ctx-blown      { background:#c93a1e; color:#fff; }
 .pin-list-arrow { color:#ccc; font-size:18px; }
 
 /* ─── Flow badge ─── */
@@ -1023,6 +1190,125 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .pin-weather-wrap { margin-bottom:12px; }
 .pin-weather-wrap:empty { display:none; }
 
+/* Sun & moon card — pin-level summary of today's sunrise/sunset + moon
+   phase. Pure-local math, shown at top of the pin editor. Layout: three
+   columns (sunrise / sunset / moon) with an optional hint line below. */
+.pin-sun-moon {
+  background:#fff;
+  border:1px solid #e0e0e0;
+  border-radius:12px;
+  padding:10px 12px;
+  margin-bottom:12px;
+}
+.pin-sun-moon .sun-moon-head {
+  display:flex;
+  justify-content:space-around;
+  gap:8px;
+}
+.pin-sun-moon .sm-col {
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  font-size:12px;
+  color:var(--muted);
+  flex:1;
+  min-width:0;
+}
+.pin-sun-moon .sm-ico { font-size:20px; line-height:1; margin-bottom:2px; }
+.pin-sun-moon .sm-val { font-size:15px; font-weight:700; color:var(--text); }
+.pin-sun-moon .sm-lbl {
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:0.4px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  max-width:100%;
+}
+.pin-sun-moon .sun-moon-hint {
+  margin-top:8px;
+  font-size:12px;
+  color:var(--brand);
+  font-weight:600;
+  text-align:center;
+  border-top:1px solid #eee;
+  padding-top:6px;
+}
+
+/* Per-catch astronomy — compact single-line summary inside each catch
+   row. Shows the sunrise/sunset + moon for that catch's specific date. */
+.catch-astro {
+  display:flex;
+  justify-content:space-between;
+  gap:6px;
+  font-size:12px;
+  color:var(--muted);
+  margin:4px 0 8px;
+  padding:6px 8px;
+  background:rgba(0,0,0,0.02);
+  border-radius:8px;
+}
+.catch-astro span {
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  flex:1;
+  text-align:center;
+}
+
+/* New-area download prompt — appears near the top of the screen when
+   the user's GPS lands outside every saved offline region + no nearby
+   pins. One-time per area; dismissal persists 7 days. */
+.new-area-toast {
+  position:fixed;
+  left:12px;
+  right:12px;
+  top:calc(env(safe-area-inset-top, 0px) + 120px);
+  z-index:2500;
+  background:var(--card);
+  border:1px solid #e0e0e0;
+  border-left:4px solid var(--brand);
+  border-radius:12px;
+  box-shadow:0 6px 24px rgba(0,0,0,0.18);
+  padding:12px 14px;
+  opacity:0;
+  transform:translateY(-12px);
+  transition:opacity 0.22s, transform 0.22s;
+  pointer-events:none;
+}
+.new-area-toast.show {
+  opacity:1;
+  transform:translateY(0);
+  pointer-events:auto;
+}
+.new-area-toast .na-text {
+  font-size:14px;
+  line-height:1.4;
+  color:var(--text);
+  margin-bottom:10px;
+}
+.new-area-toast .na-pin { margin-right:4px; }
+.new-area-toast .na-actions {
+  display:flex;
+  gap:8px;
+}
+.new-area-toast .na-btn {
+  flex:1;
+  padding:8px 12px;
+  border-radius:8px;
+  font-size:13px;
+  font-weight:600;
+  border:1px solid #d4d4d4;
+  background:#f5f5f5;
+  color:var(--text);
+  cursor:pointer;
+}
+.new-area-toast .na-btn-primary {
+  background:var(--brand);
+  color:#fff;
+  border-color:var(--brand);
+}
+
 .weather-panel {
   background:linear-gradient(135deg, #eef7ff 0%, #d9ecff 100%);
   border:1px solid #b8d7f5;
@@ -1189,6 +1475,38 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   min-height:50px;
   font-size:14px;
 }
+
+/* Per-catch photo strip — photos live on the catch, not the pin. Each
+   catch renders its own row of thumbnails + an "+ add photo" tile. */
+.catch-photos-row {
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-top:4px;
+}
+.catch-photo-thumb {
+  width:64px;
+  height:64px;
+  border-radius:8px;
+  object-fit:cover;
+  border:2px solid #e0e0e0;
+  cursor:pointer;
+}
+.catch-photo-add {
+  width:64px;
+  height:64px;
+  border-radius:8px;
+  border:2px dashed #c0c0c0;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:24px;
+  color:#aaa;
+  cursor:pointer;
+  background:var(--bg);
+  transition:border-color 0.2s, color 0.2s;
+}
+.catch-photo-add:hover { border-color:var(--brand); color:var(--brand); }
 
 /* Per-catch conditions block — 4 labeled read-only fields (flow, water
    temp, air temp, weather) auto-populated from USGS + Open-Meteo based

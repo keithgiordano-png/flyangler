@@ -117,6 +117,21 @@
   <button class="zoom-btn" id="zoom-out-btn" onclick="if(map)map.zoomOut()" title="Zoom out" aria-label="Zoom out">&#8722;</button>
 </div>
 
+<!-- Recenter-on-my-location FAB. Bottom-left, mirrors the right-side pin
+     FAB so it's always thumb-reachable while the user is looking at the map.
+     Reuses locateUser() — same handler as the top-bar 📍 button. -->
+<button class="fab fab-recenter" id="fab-recenter" onclick="locateUser()"
+        title="Recenter on my location" aria-label="Recenter on my location">
+  <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="3"/>
+    <circle cx="12" cy="12" r="8"/>
+    <line x1="12" y1="1" x2="12" y2="4"/>
+    <line x1="12" y1="20" x2="12" y2="23"/>
+    <line x1="1" y1="12" x2="4" y2="12"/>
+    <line x1="20" y1="12" x2="23" y2="12"/>
+  </svg>
+</button>
+
 <!-- Land data loading indicator -->
 <div class="land-loading" id="land-loading"><div class="spinner"></div>Loading land data...</div>
 
@@ -244,6 +259,10 @@
     <!-- Weather forecast (current + 3 days) -->
     <div id="pin-weather" class="pin-weather-wrap"></div>
 
+    <!-- Sun & moon — sunrise, sunset, moon phase for THIS pin's location.
+         Pure local math (no network), always available offline. -->
+    <div id="pin-sun-moon" class="pin-sun-moon" hidden></div>
+
     <!-- Parcel / stream-access-law info block -->
     <div id="pin-parcel-info" class="pin-parcel-info unknown"></div>
 
@@ -252,16 +271,9 @@
       <input type="text" id="pin-name" placeholder="e.g., Big Brown Hole, Evening Rise Spot">
     </div>
 
-    <div class="field-row">
-      <div class="field">
-        <label>Date</label>
-        <input type="date" id="pin-date">
-      </div>
-      <div class="field">
-        <label>Time</label>
-        <input type="time" id="pin-time">
-      </div>
-    </div>
+    <!-- Pin-level date/time removed — dates now live only on catches.
+         See §6.1.b: each catch carries its own date/time (defaults to now
+         for a fresh pin, EXIF capture time for a photo import). -->
 
     <div class="field">
       <label>River</label>
@@ -282,16 +294,16 @@
       <button type="button" class="btn-add-catch" onclick="addCatchRow()">+ Add another catch</button>
     </div>
 
-    <div class="photo-upload">
-      <label>Photos</label>
-      <div id="photo-container"></div>
-      <div class="photo-add" id="photo-add-btn">+</div>
-      <input type="file" accept="image/*" multiple style="display:none" id="photo-input" onchange="handlePhotos(this)">
-    </div>
+    <!-- Photos were moved to the catch level (see data-model rule: every
+         catch-linked field lives on the catch). Each catch row has its own
+         photo strip + "+ add photo" button. This hidden input is shared
+         across all catches — addCatchPhoto(idx) sets _attachingCatchIdx
+         before triggering it so handlePhotos knows which catch to target. -->
+    <input type="file" accept="image/*" multiple style="display:none" id="photo-input" onchange="handlePhotos(this)">
 
     <div class="field">
-      <label>Notes</label>
-      <textarea id="pin-notes" placeholder="Water conditions, hatch activity, techniques that worked..."></textarea>
+      <label>Pin notes</label>
+      <textarea id="pin-notes" placeholder="Location notes — access, parking, tricky wades. Fish-specific details belong on the catch below."></textarea>
     </div>
 
     <input type="hidden" id="pin-id">
@@ -326,6 +338,22 @@
     <div style="font-size:11px; color:var(--muted); margin-bottom:12px; margin-top:6px;">
       Single photo opens the pin editor. Bulk import silently creates pins for many photos at once,
       groups photos within 100 yd into the same pin, then sends any missing-fly catches to the Review tab.
+    </div>
+
+    <!-- Search + sort — scales to 100+ pins. Filter is case-insensitive
+         and matches name, river, and any catch's species/fly text. -->
+    <div class="pin-list-controls">
+      <input type="search" id="pin-list-search" class="pin-list-search"
+             placeholder="Search name, river, species, fly…"
+             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+             oninput="setPinListSearch(this.value)">
+      <select id="pin-list-sort" class="pin-list-sort" onchange="setPinListSort(this.value)">
+        <option value="newest">Newest first</option>
+        <option value="oldest">Oldest first</option>
+        <option value="most">Most catches</option>
+        <option value="biggest">Biggest fish</option>
+        <option value="az">A–Z by name</option>
+      </select>
     </div>
 
     <div id="pin-list-content"></div>
@@ -366,6 +394,22 @@
         <div class="setting-label">Pin Editor Sections</div>
         <div class="setting-desc">Uncheck any info block you'd rather not see on the pin screen.</div>
         <div id="pin-sections-settings" class="pin-sections-settings" style="margin-top:10px;"></div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Battery-Saver GPS</div>
+        <div class="setting-desc">
+          Uses Wi-Fi / cell positioning instead of the GPS chip. Roughly
+          50&ndash;100&nbsp;m accurate, ~90% less battery — good enough for
+          pin drops on a fishable run. Leave Auto on to let the app
+          switch itself on low battery (Android only; iOS set manually).
+        </div>
+        <div class="chip-group" style="margin-top:8px;">
+          <span class="chip" id="chip-lowgps-on" onclick="setLowPowerGps(true)">On</span>
+          <span class="chip active" id="chip-lowgps-off" onclick="setLowPowerGps(false)">Off</span>
+        </div>
       </div>
     </div>
 
@@ -427,6 +471,14 @@
 
     <div class="setting-row">
       <div style="width:100%">
+        <div class="setting-label">Hatch Calendar</div>
+        <div class="setting-desc">What's hatching now in Western MT — 100% offline reference with fly recommendations.</div>
+        <button class="btn btn-primary" style="margin-top:8px" onclick="openHatchCalendar()">Open Hatch Calendar</button>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div style="width:100%">
         <div class="setting-label">Offline Map Regions</div>
         <div class="setting-desc">Download tiles so the map renders without cell signal</div>
         <button class="btn btn-primary" style="margin-top:8px" onclick="openDownloadModal()">+ Download This View</button>
@@ -450,30 +502,36 @@
     <h2>&#128202; Reports <button class="modal-close" onclick="closeModal('modal-reports')">&times;</button></h2>
 
     <div class="report-filters">
-      <div class="field">
-        <label>River</label>
-        <select id="rep-river" onchange="renderReports()"></select>
+      <div class="field-row">
+        <div class="field">
+          <label>River</label>
+          <select id="rep-river" onchange="scheduleRenderReports()"></select>
+        </div>
+        <div class="field">
+          <label>Pin (specific spot)</label>
+          <select id="rep-pin" onchange="scheduleRenderReports()"></select>
+        </div>
       </div>
 
       <div class="field-row">
         <div class="field">
           <label>Flow Rate</label>
-          <select id="rep-flow" onchange="renderReports()"></select>
+          <select id="rep-flow" onchange="scheduleRenderReports()"></select>
         </div>
         <div class="field">
           <label>Water Temp</label>
-          <select id="rep-water" onchange="renderReports()"></select>
+          <select id="rep-water" onchange="scheduleRenderReports()"></select>
         </div>
       </div>
 
       <div class="field-row">
         <div class="field">
           <label>Air Temp</label>
-          <select id="rep-air" onchange="renderReports()"></select>
+          <select id="rep-air" onchange="scheduleRenderReports()"></select>
         </div>
         <div class="field">
           <label>Weather</label>
-          <select id="rep-weather" onchange="renderReports()"></select>
+          <select id="rep-weather" onchange="scheduleRenderReports()"></select>
         </div>
       </div>
 
@@ -495,6 +553,24 @@
       once every catch has a fly logged, it leaves this list automatically.
     </p>
     <div id="review-content"></div>
+  </div>
+</div>
+
+<!-- Modal: Hatch Calendar — cached, works 100% offline -->
+<div class="modal-overlay" id="modal-hatch">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <h2>&#128027; Hatch Calendar <button class="modal-close" onclick="closeModal('modal-hatch')">&times;</button></h2>
+    <p style="font-size:12px; color:var(--muted); margin-top:-8px; margin-bottom:12px;">
+      What's hatching now in Western Montana. Taps show suggested flies
+      and timing notes. 100% offline.
+    </p>
+    <div class="hatch-month-nav">
+      <button type="button" class="hatch-month-btn" id="hatch-prev" onclick="shiftHatchMonth(-1)" aria-label="Previous month">&lsaquo;</button>
+      <div class="hatch-month-label" id="hatch-month-label">—</div>
+      <button type="button" class="hatch-month-btn" id="hatch-next" onclick="shiftHatchMonth(1)" aria-label="Next month">&rsaquo;</button>
+    </div>
+    <div id="hatch-content"></div>
   </div>
 </div>
 

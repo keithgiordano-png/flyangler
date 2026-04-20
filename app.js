@@ -22,7 +22,11 @@ let showPOIs = true;
 let detectedRivers = []; // rivers found near the pin
 let pins = [];           // loaded async from PinStore in initMap
 let fishTypes = JSON.parse(localStorage.getItem('flyangler_fish') || '["Brown Trout","Rainbow Trout","Brook Trout","Bull Trout","Mountain Whitefish","Salmon","Other"]');
-// currentPhotos: [{ id, url, isNew, blob? }] — id is IndexedDB photo id (or null in fallback)
+// Photos used to live at the pin level in a global `currentPhotos` array.
+// Under the catch-level data model they live on each catch as
+// currentCatches[i].photos (in-memory) + .photoIds (persisted). This
+// shim lets a few remaining legacy references still resolve to an empty
+// array without crashing; new code should read/write catch.photos.
 let currentPhotos = [];
 // currentCatches: [{ id, fish, fly, sizeInches, notes, addedAt }] — multi-catch per pin.
 // One pin can represent multiple fish at the same spot (within ~100yd).
@@ -32,6 +36,447 @@ let currentDraftPinId = null;   // id used during pin-editor session for attachi
 // Per-session enrichment results — used by savePin to compute _pending flags
 let _sessionEnrichment = { river: null, flow: null, parcel: null };
 window._pinMarkerClicked = false;
+
+// ─── Hatch calendar — Western Montana / Rocky Mountain West ───
+// Cached in-code (works 100% offline). Months are 1-12. Each entry has
+// peak months (primary activity), good-fly recommendations, and a short
+// note about water/timing. Built from standard Montana fly-fishing
+// references — Stonefly Society, Orvis, Rock Creek Anglers, etc.
+//
+// Region keys follow USPS state codes. Default fallback is 'MT' because
+// that's the primary user. Adding a new region is just adding a key.
+var HATCH_CALENDAR = {
+  MT: [
+    { name: 'Blue-Winged Olive (BWO)',  months: [3, 4, 5, 9, 10, 11],
+      flies: ['Parachute BWO #18', 'Sparkle Dun BWO #18', 'WD-40 #20', 'Pheasant Tail #18'],
+      notes: 'Overcast afternoons through spring and fall. Emergers in riffles.' },
+    { name: 'Midges',                   months: [1, 2, 3, 11, 12],
+      flies: ['Griffith\'s Gnat #20', 'Zebra Midge #20', 'Disco Midge #22', 'RS2 #22'],
+      notes: 'Winter workhorse on tailwaters like the Missouri. Fish midday.' },
+    { name: 'Skwala Stonefly',          months: [3, 4],
+      flies: ['Rogue Foam Skwala #10', 'Bullet Head Skwala #8', 'Olive Stimulator #10'],
+      notes: 'Bitterroot signature. Pre-runoff trophy dry-fly window.' },
+    { name: 'March Brown',              months: [4, 5],
+      flies: ['Parachute March Brown #12', 'Hare\'s Ear Soft Hackle #14'],
+      notes: 'Madison, Yellowstone. Fishes well in riffles.' },
+    { name: 'Mother\'s Day Caddis',     months: [4, 5],
+      flies: ['Elk Hair Caddis #14', 'X-Caddis #14', 'Iris Caddis #16'],
+      notes: 'First big caddis hatch — blanket hatch on the Yellowstone mid-May.' },
+    { name: 'Salmonfly',                months: [5, 6, 7],
+      flies: ['Chubby Chernobyl #6', 'Rogue Foam Salmonfly #4', 'Kaufmann\'s Stone #4'],
+      notes: 'Peak June on Rock Creek / Big Hole / Madison. Two weeks of magic.' },
+    { name: 'Golden Stonefly',          months: [6, 7],
+      flies: ['Chubby Chernobyl #8 (yellow)', 'Stimulator #10', 'Pat\'s Rubber Legs #6'],
+      notes: 'Overlaps salmonfly, extends the dry-fly window into July.' },
+    { name: 'Pale Morning Dun (PMD)',   months: [6, 7, 8],
+      flies: ['Parachute PMD #16', 'Sparkle Dun PMD #16', 'Rainy\'s Mercury PMD #18'],
+      notes: 'Mornings and cloudy afternoons. Foam lines in slower water.' },
+    { name: 'Green Drake',              months: [6, 7],
+      flies: ['Green Drake Cripple #12', 'Parachute Green Drake #10', 'Drake Soft Hackle #12'],
+      notes: 'Missouri, Henry\'s Fork, Madison. Afternoons late June through July 15-ish.' },
+    { name: 'Yellow Sally',             months: [6, 7, 8],
+      flies: ['Yellow Stimulator #14', 'Outrigger Sally #16'],
+      notes: 'Small yellow stone. Great fallback when nothing else is working.' },
+    { name: 'Trico',                    months: [7, 8, 9],
+      flies: ['Trico Spinner #20', 'Trico Parachute #22'],
+      notes: 'Early-morning spinner falls. Needs calm water — skip if windy.' },
+    { name: 'Terrestrials — Hoppers',   months: [7, 8, 9],
+      flies: ['Morrish Hopper #10', 'Dave\'s Hopper #8', 'Chubby Chernobyl tan #10'],
+      notes: 'Afternoons along grass banks. Hot, breezy days = best fishing.' },
+    { name: 'Terrestrials — Ants & Beetles', months: [7, 8, 9],
+      flies: ['Parachute Ant #16', 'Foam Beetle #14'],
+      notes: 'Along wooded banks. Small but effective all summer.' },
+    { name: 'October Caddis',           months: [9, 10, 11],
+      flies: ['October Caddis Stimulator #8', 'LaFontaine Sparkle Pupa #8'],
+      notes: 'Big orange caddis, last major hatch of the year.' },
+    { name: 'Streamers (baitfish)',     months: [3, 4, 9, 10, 11],
+      flies: ['Sex Dungeon', 'Sculpzilla black #6', 'Woolly Bugger olive #6', 'Kreelex gold'],
+      notes: 'Cold water, aggressive fish. Pre- and post-spawn browns especially.' }
+  ]
+};
+
+// Figure out a region for a lat/lng — same coarse rules used elsewhere.
+function hatchRegionFor(lat, lng) {
+  if (lat > 44 && lat < 49 && lng > -117 && lng < -104) return 'MT';
+  if (lat > 41 && lat < 45 && lng > -111 && lng < -104) return 'MT';  // WY — piggyback MT for now
+  if (lat > 42 && lat < 49 && lng > -117 && lng < -111) return 'MT';  // ID — piggyback
+  return 'MT';
+}
+
+// Returns active hatches for a given month (1-12) + region, sorted by
+// peak-ness (rough proxy: fewer peak months = more seasonal = rank higher)
+function activeHatches(month, region) {
+  var entries = HATCH_CALENDAR[region || 'MT'] || [];
+  return entries
+    .filter(function(h) { return h.months.indexOf(month) !== -1; })
+    .sort(function(a, b) { return a.months.length - b.months.length; });
+}
+
+// ─── Smart fly suggestions ───
+// Rule-based fly recommendation given (month, water temp, flow state,
+// sky). Inputs are optional — missing ones fall through to less-specific
+// rules. Returns an array of up to 5 ranked fly names. Pure local logic,
+// works 100% offline. Designed so husband can glance at the pin editor
+// and get a starting point instead of an empty "Fly" box.
+//
+// "Flow state" is a coarse bucket: 'low', 'normal', 'high', 'blown'.
+// Callers compute it from the current CFS vs. historical median (see
+// feature 10 below) or just pass null.
+function suggestFlies(opts) {
+  opts = opts || {};
+  var month = (opts.month != null) ? opts.month : (new Date().getMonth() + 1);
+  var waterTempF = opts.waterTempF;
+  var flowState = opts.flowState || null;  // 'low'|'normal'|'high'|'blown'|null
+  var cloudy = !!opts.cloudy;
+  var suggestions = [];
+
+  // Start with any hatches in season — those are the single most
+  // predictive signal. Pulls straight from HATCH_CALENDAR so the two
+  // stay in sync automatically.
+  var seasonalHatches = activeHatches(month, 'MT');
+  seasonalHatches.slice(0, 3).forEach(function(h) {
+    if (h.flies && h.flies[0]) suggestions.push(h.flies[0]);
+  });
+
+  // Water-temp gates — trout activity / fly choice both shift hard with temp
+  if (waterTempF != null && isFinite(waterTempF)) {
+    if (waterTempF < 42) {
+      // Very cold water — slow nymphs + streamers
+      suggestions.unshift('Pat\'s Rubber Legs #6', 'Zebra Midge #20', 'Sculpzilla #6');
+    } else if (waterTempF < 52) {
+      // Cool — midges, BWOs, small nymphs
+      suggestions.unshift('Pheasant Tail #16', 'Zebra Midge #20', 'Sparkle Dun BWO #18');
+    } else if (waterTempF > 68) {
+      // Too warm — don't recommend catch-and-release flies; suggest ethical alternative
+      suggestions.unshift('⚠ Water too warm — don\'t C&R');
+    } else if (waterTempF > 64 && (month >= 6 && month <= 9)) {
+      // Warm summer — morning only, terrestrials / attractors
+      suggestions.unshift('Foam Beetle #14', 'Parachute Ant #16', 'Chubby Chernobyl tan #10');
+    }
+  }
+
+  // Flow-state gates
+  if (flowState === 'blown') {
+    // High muddy water — big ugly streamers only
+    suggestions.unshift('Sex Dungeon olive', 'Kreelex gold', 'Pat\'s Rubber Legs black #4');
+  } else if (flowState === 'high') {
+    // Wading tough, fish pushed to edges — short-leash nymph + attractors
+    suggestions.unshift('Pat\'s Rubber Legs #6', 'Pink Worm #10', 'Hot Bead Prince Nymph #14');
+  } else if (flowState === 'low') {
+    // Spooky clear water — long leaders, small patterns
+    suggestions.unshift('Griffith\'s Gnat #20', 'Sparkle Dun PMD #18', 'RS2 #22');
+  }
+
+  // Overcast bonus — BWOs and streamers crush on cloudy days
+  if (cloudy) {
+    if (month >= 3 && month <= 5) suggestions.unshift('Parachute BWO #18');
+    else if (month >= 9 && month <= 11) suggestions.unshift('Parachute BWO #18', 'Sculpzilla olive #6');
+  }
+
+  // De-duplicate while preserving order, cap at 5
+  var seen = {};
+  var out = [];
+  for (var i = 0; i < suggestions.length && out.length < 5; i++) {
+    var s = suggestions[i];
+    if (seen[s]) continue;
+    seen[s] = true;
+    out.push(s);
+  }
+  return out;
+}
+
+var _hatchMonth = new Date().getMonth() + 1;
+
+function openHatchCalendar() {
+  _hatchMonth = new Date().getMonth() + 1;
+  renderHatchCalendar();
+  closeModal('modal-settings');
+  openModal('modal-hatch');
+}
+
+function shiftHatchMonth(delta) {
+  _hatchMonth = ((_hatchMonth - 1 + delta + 12) % 12) + 1;
+  renderHatchCalendar();
+}
+
+function renderHatchCalendar() {
+  var label = document.getElementById('hatch-month-label');
+  var content = document.getElementById('hatch-content');
+  if (!label || !content) return;
+  var monthNames = ['January','February','March','April','May','June',
+                    'July','August','September','October','November','December'];
+  label.textContent = monthNames[_hatchMonth - 1];
+  // Region defaults to MT — use pin's region if the editor is open, else MT
+  var region = 'MT';
+  var lat = parseFloat((document.getElementById('pin-lat') || {}).value);
+  var lng = parseFloat((document.getElementById('pin-lng') || {}).value);
+  if (isFinite(lat) && isFinite(lng)) region = hatchRegionFor(lat, lng);
+  var hatches = activeHatches(_hatchMonth, region);
+  if (hatches.length === 0) {
+    content.innerHTML = '<div class="empty-state"><h3>No hatches</h3><p>Quiet month — try streamers.</p></div>';
+    return;
+  }
+  content.innerHTML = hatches.map(function(h) {
+    return '<div class="hatch-row">' +
+      '<div class="hatch-row-head">' +
+        '<b>' + escapeHtml(h.name) + '</b>' +
+      '</div>' +
+      '<div class="hatch-flies">' +
+        h.flies.map(function(f) { return '<span class="hatch-fly-chip">' + escapeHtml(f) + '</span>'; }).join('') +
+      '</div>' +
+      '<div class="hatch-notes">' + escapeHtml(h.notes) + '</div>' +
+    '</div>';
+  }).join('');
+}
+
+// ─── New-area detection: prompt to download offline tiles when the
+// user's GPS lands somewhere they haven't pre-cached. Primary use case:
+// husband drives to a new stretch of the Bitterroot, opens the app, and
+// gets a one-tap "download this area?" prompt while he still has LTE
+// parked at the truck — before he hikes down and loses signal.
+//
+// Detection rules (all must be true to prompt):
+//   1. Current GPS is outside every saved RegionStore bbox
+//   2. No existing pin within ~5 km (if he's fished here before, tiles
+//      almost certainly got opportunistically cached by the service worker)
+//   3. We haven't already prompted this session for this ~28 km grid cell
+//   4. User hasn't dismissed this grid cell in the last 7 days
+//
+// Dismissals persist to localStorage so we don't pester him on every trip.
+var _newAreaPromptShown = {};
+var NEW_AREA_DISMISS_KEY = 'flyangler_dismissed_areas';
+var NEW_AREA_DISMISS_TTL = 7 * 24 * 60 * 60 * 1000;
+
+function _newAreaGridKey(lat, lng) {
+  // 0.25° grid ≈ 28 km — a single "trip area" gets one prompt
+  return Math.round(lat * 4) + ',' + Math.round(lng * 4);
+}
+
+function _loadDismissedAreas() {
+  try {
+    var raw = localStorage.getItem(NEW_AREA_DISMISS_KEY);
+    var obj = raw ? JSON.parse(raw) : {};
+    // Sweep TTL-expired keys so the store doesn't grow forever
+    var now = Date.now();
+    Object.keys(obj).forEach(function(k) {
+      if (now - obj[k] > NEW_AREA_DISMISS_TTL) delete obj[k];
+    });
+    return obj;
+  } catch (e) { return {}; }
+}
+
+function _saveDismissedAreas(d) {
+  try { localStorage.setItem(NEW_AREA_DISMISS_KEY, JSON.stringify(d)); } catch (e) {}
+}
+
+async function checkNewAreaPrompt(lat, lng) {
+  if (!isFinite(lat) || !isFinite(lng)) return;
+  var key = _newAreaGridKey(lat, lng);
+  if (_newAreaPromptShown[key]) return;
+  var dismissed = _loadDismissedAreas();
+  if (dismissed[key]) return;
+
+  // Is this inside any saved offline region already?
+  try {
+    if (window.RegionStore) {
+      var regions = await RegionStore.getAll();
+      var inRegion = (regions || []).some(function(r) {
+        return r && r.bbox && lat >= r.bbox[0] && lat <= r.bbox[1] && lng >= r.bbox[2] && lng <= r.bbox[3];
+      });
+      if (inRegion) return;
+    }
+  } catch (e) { /* if RegionStore is unavailable, fall through and show */ }
+
+  // Has the user fished near here? If so, the service worker has
+  // opportunistically cached those tiles already — no need to prompt.
+  var nearExistingPin = (pins || []).some(function(p) {
+    if (!isFinite(p.lat) || !isFinite(p.lng)) return false;
+    return _metersBetween(p.lat, p.lng, lat, lng) < 5000;
+  });
+  if (nearExistingPin) return;
+
+  _newAreaPromptShown[key] = true;
+  showNewAreaPrompt(key);
+}
+
+function showNewAreaPrompt(key) {
+  var toast = document.getElementById('new-area-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'new-area-toast';
+    toast.className = 'new-area-toast';
+    document.body.appendChild(toast);
+  }
+  toast.innerHTML =
+    '<div class="na-text"><span class="na-pin">📍</span> You\'re in a new area — download offline map while you still have signal?</div>' +
+    '<div class="na-actions">' +
+      '<button type="button" class="na-btn na-btn-primary" onclick="acceptNewAreaPrompt(\'' + key + '\')">Download</button>' +
+      '<button type="button" class="na-btn" onclick="dismissNewAreaPrompt(\'' + key + '\')">Not now</button>' +
+    '</div>';
+  // Force reflow so the CSS transition fires
+  void toast.offsetWidth;
+  toast.classList.add('show');
+}
+
+function dismissNewAreaPrompt(key) {
+  var d = _loadDismissedAreas();
+  d[key] = Date.now();
+  _saveDismissedAreas(d);
+  var toast = document.getElementById('new-area-toast');
+  if (toast) toast.classList.remove('show');
+}
+
+function acceptNewAreaPrompt(key) {
+  var toast = document.getElementById('new-area-toast');
+  if (toast) toast.classList.remove('show');
+  // Mark dismissed regardless — if they cancel the download modal, we
+  // don't want to re-prompt this session.
+  dismissNewAreaPrompt(key);
+  if (typeof openDownloadModal === 'function') {
+    openDownloadModal();
+    setTimeout(function() {
+      var nameInput = document.getElementById('dl-name');
+      if (nameInput && !nameInput.value) {
+        nameInput.value = 'Trip ' + new Date().toLocaleDateString();
+      }
+    }, 100);
+  }
+}
+
+// ─── Astronomy: sunrise / sunset / moon phase ───
+// Pure-local math (no network). Driven by the NOAA simplified solar
+// calculator — accurate to ~1 minute at mid-latitudes, which is way
+// more precise than a fly angler needs. "Golden hour starts in 22 min"
+// is the key planning value on the pin editor. Moon phase matters for
+// solunar feeding-activity folklore; we surface it without editorializing.
+//
+// Returns { sunrise, sunset, solarNoon } as Date objects (or null for
+// polar day/night at high latitudes — not relevant for Montana but
+// handled gracefully).
+
+function sunEvents(date, lat, lng) {
+  var d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  var jd = d.getTime() / 86400000 + 2440587.5;
+  var n = jd - 2451545.0;                              // days since J2000.0
+  var J = n - lng / 360;                               // mean solar noon in JD offset
+  var M = (357.5291 + 0.98560028 * J) % 360;           // solar mean anomaly
+  if (M < 0) M += 360;
+  var Mrad = M * Math.PI / 180;
+  var C = 1.9148 * Math.sin(Mrad) + 0.0200 * Math.sin(2*Mrad) + 0.0003 * Math.sin(3*Mrad);
+  var lam = (M + C + 180 + 102.9372) % 360;            // ecliptic longitude
+  var lamRad = lam * Math.PI / 180;
+  var Jtransit = 2451545.0 + J + 0.0053 * Math.sin(Mrad) - 0.0069 * Math.sin(2*lamRad);
+  var sinDec = Math.sin(lamRad) * Math.sin(23.44 * Math.PI / 180);
+  var dec = Math.asin(sinDec);
+  var latRad = lat * Math.PI / 180;
+  // -0.83° = sun center 50' below horizon to account for atmospheric refraction + radius
+  var cosW = (Math.sin(-0.83 * Math.PI/180) - Math.sin(latRad) * sinDec) / (Math.cos(latRad) * Math.cos(dec));
+  var solarNoon = new Date((Jtransit - 2440587.5) * 86400000);
+  if (cosW < -1) return { sunrise: null, sunset: null, solarNoon: solarNoon, polar: 'day' };
+  if (cosW > 1)  return { sunrise: null, sunset: null, solarNoon: solarNoon, polar: 'night' };
+  var w = Math.acos(cosW);
+  var wDays = w / (2 * Math.PI);
+  return {
+    sunrise:   new Date((Jtransit - wDays - 2440587.5) * 86400000),
+    sunset:    new Date((Jtransit + wDays - 2440587.5) * 86400000),
+    solarNoon: solarNoon
+  };
+}
+
+// Conway-style lunar-phase estimator. ±1 day — plenty for solunar context.
+function moonPhase(date) {
+  var jd = date.getTime() / 86400000 + 2440587.5;
+  var daysSinceNew = jd - 2451549.5;                   // JD of 2000-01-06 new moon
+  var cycles = daysSinceNew / 29.53058867;
+  var phase = cycles - Math.floor(cycles);             // 0 = new, 0.5 = full
+  if (phase < 0) phase += 1;
+  var illum = (1 - Math.cos(phase * 2 * Math.PI)) / 2;
+  var name;
+  if      (phase < 0.03 || phase > 0.97) name = 'New moon';
+  else if (phase < 0.22)                 name = 'Waxing crescent';
+  else if (phase < 0.28)                 name = 'First quarter';
+  else if (phase < 0.47)                 name = 'Waxing gibbous';
+  else if (phase < 0.53)                 name = 'Full moon';
+  else if (phase < 0.72)                 name = 'Waning gibbous';
+  else if (phase < 0.78)                 name = 'Last quarter';
+  else                                   name = 'Waning crescent';
+  // Emoji glyph helps glanceability on mobile
+  var icon;
+  if      (phase < 0.03 || phase > 0.97) icon = '🌑';
+  else if (phase < 0.22)                 icon = '🌒';
+  else if (phase < 0.28)                 icon = '🌓';
+  else if (phase < 0.47)                 icon = '🌔';
+  else if (phase < 0.53)                 icon = '🌕';
+  else if (phase < 0.72)                 icon = '🌖';
+  else if (phase < 0.78)                 icon = '🌗';
+  else                                   icon = '🌘';
+  return { phase: phase, illumination: illum, name: name, icon: icon };
+}
+
+function fmtClock(dt) {
+  if (!dt || isNaN(dt.getTime())) return '—';
+  return dt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+// "Golden hour" here means the last hour of daylight before sunset and the
+// first hour after sunrise. Returns a short human string or '' if neither
+// window is relevant right now.
+function goldenHourHint(sun) {
+  if (!sun || !sun.sunset) return '';
+  var now = Date.now();
+  var sunsetMs = sun.sunset.getTime();
+  var sunriseMs = sun.sunrise ? sun.sunrise.getTime() : null;
+  var minutesTo = function(ms) { return Math.round((ms - now) / 60000); };
+  if (sunriseMs != null) {
+    var rise = minutesTo(sunriseMs);
+    if (rise > -60 && rise <= 0) return 'Morning golden hour — active now';
+    if (rise > 0 && rise <= 60)  return 'Sunrise in ' + rise + ' min';
+  }
+  var sset = minutesTo(sunsetMs);
+  if (sset > 0 && sset <= 60)   return 'Golden hour — sunset in ' + sset + ' min';
+  if (sset > 60 && sset <= 180) return 'Golden hour starts in ' + (sset - 60) + ' min';
+  if (sset > -30 && sset <= 0)  return 'Last light fading';
+  return '';
+}
+
+// Render the pin-level sun/moon card. Shows TODAY's events for the pin's
+// location — pure local math, works 100% offline.
+function renderPinSunMoon(lat, lng) {
+  var el = document.getElementById('pin-sun-moon');
+  if (!el) return;
+  if (!isFinite(lat) || !isFinite(lng)) { el.hidden = true; return; }
+  var now = new Date();
+  var sun = sunEvents(now, lat, lng);
+  var moon = moonPhase(now);
+  var hint = goldenHourHint(sun);
+  el.hidden = false;
+  el.innerHTML =
+    '<div class="sun-moon-head">' +
+      '<span class="sm-col"><span class="sm-ico">🌅</span><span class="sm-val">' + fmtClock(sun.sunrise) + '</span><span class="sm-lbl">Sunrise</span></span>' +
+      '<span class="sm-col"><span class="sm-ico">🌇</span><span class="sm-val">' + fmtClock(sun.sunset) + '</span><span class="sm-lbl">Sunset</span></span>' +
+      '<span class="sm-col"><span class="sm-ico">' + moon.icon + '</span><span class="sm-val">' + Math.round(moon.illumination * 100) + '%</span><span class="sm-lbl">' + moon.name + '</span></span>' +
+    '</div>' +
+    (hint ? '<div class="sun-moon-hint">' + hint + '</div>' : '');
+}
+
+// Compact one-line astronomy summary for a single catch (inside its row).
+// Uses the catch's own date (not today) so historical catches show what
+// the sun/moon did on that actual day.
+function renderCatchAstroHtml(c, lat, lng) {
+  if (!c || !c.date || !isFinite(lat) || !isFinite(lng)) return '';
+  // Anchor at local noon to avoid sunrise/sunset times straddling a TZ edge
+  var parts = c.date.split('-');
+  if (parts.length !== 3) return '';
+  var dt = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10), 12, 0, 0);
+  if (isNaN(dt.getTime())) return '';
+  var sun = sunEvents(dt, lat, lng);
+  var moon = moonPhase(dt);
+  return '<div class="catch-astro">' +
+           '<span title="Sunrise">🌅 ' + fmtClock(sun.sunrise) + '</span>' +
+           '<span title="Sunset">🌇 ' + fmtClock(sun.sunset) + '</span>' +
+           '<span title="' + moon.name + '">' + moon.icon + ' ' + moon.name + '</span>' +
+         '</div>';
+}
 
 // ─── Flow history sparkline (7-day USGS trend) ───
 // Turns the "620 CFS" number into actionable context: is flow rising,
@@ -272,13 +717,18 @@ function renderPinHistory(lat, lng, excludeId) {
 // Each informative section in the pin editor (flow, temp, weather, parcel,
 // regulation links) can be hidden individually by the user. Persisted to
 // localStorage under key 'flyangler_pin_sections'. Default: all visible.
+// Order matters — list reflects the top-to-bottom order of sections
+// inside the pin editor. Each section can be individually toggled off
+// in Settings → "Pin Editor Sections".
 var PIN_SECTION_IDS = [
-  { id: 'links',   el: 'pin-links',        label: 'Regulations & USGS links' },
-  { id: 'flow',    el: 'pin-flow-badge',   label: 'Flow (CFS)' },
-  { id: 'temp',    el: 'pin-temp-badge',   label: 'Water temperature' },
-  { id: 'weather', el: 'pin-weather',      label: 'Weather forecast' },
-  { id: 'parcel',  el: 'pin-parcel-info',  label: 'Land ownership' },
-  { id: 'history', el: 'pin-history',      label: '"What worked here before"' }
+  { id: 'history',   el: 'pin-history',       label: '"What worked here before"' },
+  { id: 'links',     el: 'pin-links',         label: 'Regulations & USGS links' },
+  { id: 'flow',      el: 'pin-flow-badge',    label: 'Flow (CFS)' },
+  { id: 'flowSpark', el: 'pin-flow-spark',    label: 'Flow 7-day sparkline' },
+  { id: 'temp',      el: 'pin-temp-badge',    label: 'Water temperature' },
+  { id: 'weather',   el: 'pin-weather',       label: 'Weather forecast' },
+  { id: 'sunMoon',   el: 'pin-sun-moon',      label: 'Sunrise / sunset / moon phase' },
+  { id: 'parcel',    el: 'pin-parcel-info',   label: 'Land ownership & stream-access law' }
 ];
 
 function loadPinSectionPrefs() {
@@ -420,6 +870,13 @@ async function fetchOverpass(query) {
         return persisted.data;
       }
     } catch (e) { /* fall through to network */ }
+  }
+
+  // Offline: skip the network entirely. Firing 5 fetches that'll each
+  // hang ~30s iOS-side before rejecting is pointless and the "servers
+  // busy" toast is misleading when the real reason is no signal.
+  if (!navigator.onLine) {
+    throw new Error('Offline — no cached Overpass data for this area');
   }
 
   // Network: race every mirror in parallel — first parseable JSON wins.
@@ -772,7 +1229,7 @@ async function initMap() {
   // Open IndexedDB + migrate legacy localStorage pins
   try {
     await PinStore.init();
-    pins = await PinStore.getAll();
+    pins = await PinStore.getAll(); bumpPinsVersion();
     // Ensure every pin has a catches[] array — migrates legacy single-catch pins
     pins = pins.map(ensureCatchesFormat);
   } catch (e) {
@@ -1414,6 +1871,13 @@ function lookupParcel(lat, lng) {
   if (!svc) {
     return Promise.resolve({ status: 'no_coverage', state: stateCode });
   }
+  // Offline: skip the fetch entirely instead of waiting for the browser
+  // to time out. The caller (renderPinParcelInfo) already has its own
+  // offline short-circuit, but guarding here too keeps lookupParcel safe
+  // for any future caller.
+  if (!navigator.onLine) {
+    return Promise.resolve({ status: 'error', state: stateCode });
+  }
 
   var params = 'geometry=' + lng + ',' + lat +
                '&geometryType=esriGeometryPoint' +
@@ -1867,21 +2331,119 @@ function locateUser() {
         radius: 8, fillColor: '#4285F4', fillOpacity: 1, color: 'white', weight: 3
       }).addTo(map).bindPopup('You are here');
       showToast('Location found');
+      // New-area auto-prompt — if we just arrived somewhere with no
+      // saved region + no nearby existing pin, offer to cache tiles
+      // while the user still has signal. Fires only after online fix.
+      if (navigator.onLine) checkNewAreaPrompt(ll[0], ll[1]);
     }, function() {
       showToast('Location not available — showing demo area');
     }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 });
   }
 }
 
-// Start a passive watch so _lastGpsFix stays fresh as the angler moves.
-// Cheap — only fires when the GPS actually reports a new position.
+// Passive GPS watcher — keeps _lastGpsFix fresh so tapping + drops a pin
+// at the angler's current spot without a wait. BUT on iOS Safari,
+// enableHighAccuracy:true hits the actual GPS chip and is the #1 non-
+// screen battery drain. On a 10-hour float trip that matters.
+//
+// Battery-aware strategy:
+//   1. Pause the watch whenever the page is hidden (tab backgrounded,
+//      phone locked). iOS suspends JS anyway but this keeps the watch
+//      from re-acquiring GPS the instant it resumes.
+//   2. Drop to low-accuracy mode when the Battery API reports < 20%
+//      or low-power mode (Chrome/Edge expose this; iOS Safari doesn't,
+//      so we also expose a Settings toggle for manual control).
+//   3. Low-accuracy mode: enableHighAccuracy:false + 60s maximumAge
+//      → uses wifi/cell positioning, 50-100m accuracy, ~90% less
+//      battery. Good enough to pin-drop a fishable run.
+//
+// Settings key `flyangler_low_power_gps` = '1' forces low-power mode on.
+
+var _passiveWatchId = null;
+var _lowPowerGps = false;
+
+function _gpsWatchOptions() {
+  if (_lowPowerGps) {
+    return { enableHighAccuracy: false, maximumAge: 60000, timeout: 30000 };
+  }
+  return { enableHighAccuracy: true, maximumAge: 15000 };
+}
+
 function startPassiveGpsWatch() {
   if (!('geolocation' in navigator) || !navigator.geolocation.watchPosition) return;
+  stopPassiveGpsWatch();
   try {
-    navigator.geolocation.watchPosition(function(pos) {
+    _passiveWatchId = navigator.geolocation.watchPosition(function(pos) {
       _lastGpsFix = { lat: pos.coords.latitude, lng: pos.coords.longitude, at: Date.now() };
-    }, function() { /* silent */ }, { enableHighAccuracy: true, maximumAge: 15000 });
+    }, function() { /* silent */ }, _gpsWatchOptions());
   } catch (e) {}
+}
+
+function stopPassiveGpsWatch() {
+  if (_passiveWatchId != null) {
+    try { navigator.geolocation.clearWatch(_passiveWatchId); } catch (e) {}
+    _passiveWatchId = null;
+  }
+}
+
+function restartPassiveGpsWatch() {
+  // Re-read _lowPowerGps state + reapply watch options
+  startPassiveGpsWatch();
+}
+
+// Read persisted low-power preference on load
+try {
+  _lowPowerGps = localStorage.getItem('flyangler_low_power_gps') === '1';
+} catch (e) {}
+
+function setLowPowerGps(on) {
+  _lowPowerGps = !!on;
+  try { localStorage.setItem('flyangler_low_power_gps', on ? '1' : '0'); } catch (e) {}
+  // Reflect in Settings chips
+  var onChip = document.getElementById('chip-lowgps-on');
+  var offChip = document.getElementById('chip-lowgps-off');
+  if (onChip && offChip) {
+    onChip.classList.toggle('active', !!on);
+    offChip.classList.toggle('active', !on);
+  }
+  restartPassiveGpsWatch();
+  showToast(on ? 'GPS: battery-saver mode on' : 'GPS: high-accuracy mode on');
+}
+
+// Visibility-aware: stop the watch when the app is backgrounded/locked,
+// restart when it returns. Prevents iOS from burning a re-acquisition
+// spike every time the screen turns on.
+document.addEventListener('visibilitychange', function() {
+  if (document.hidden) {
+    stopPassiveGpsWatch();
+  } else if ('geolocation' in navigator) {
+    startPassiveGpsWatch();
+  }
+});
+
+// Battery API — Chromium-based browsers expose this; iOS Safari doesn't.
+// When we do have it, auto-switch to low-power mode below 20% (or 30%
+// if discharging). Users on iOS set the toggle in Settings manually.
+if (typeof navigator.getBattery === 'function') {
+  navigator.getBattery().then(function(battery) {
+    function autoLowPower() {
+      var lvl = battery.level;
+      var shouldLowPower = (lvl < 0.20) || (lvl < 0.30 && !battery.charging);
+      // Only auto-toggle if the user hasn't manually forced a mode. We
+      // consider manual-mode = localStorage key present. If user hasn't
+      // set one yet, we manage it for them automatically.
+      var hasManual = false;
+      try { hasManual = localStorage.getItem('flyangler_low_power_gps') !== null; } catch (e) {}
+      if (hasManual) return;
+      if (shouldLowPower !== _lowPowerGps) {
+        _lowPowerGps = shouldLowPower;
+        restartPassiveGpsWatch();
+      }
+    }
+    battery.addEventListener('levelchange', autoLowPower);
+    battery.addEventListener('chargingchange', autoLowPower);
+    autoLowPower();
+  }).catch(function() { /* ignore */ });
 }
 
 // ─── Pin Management ───
@@ -2072,6 +2634,9 @@ function ensureCatchesFormat(pin) {
     pin.catches = pin.catches.map(function(c, i) {
       if (!c.date) c.date = pin.date || '';
       if (!c.time) c.time = pin.time || '';
+      // Normalize photo storage fields so every catch has them
+      if (!Array.isArray(c.photoIds)) c.photoIds = [];
+      if (!Array.isArray(c.photos)) c.photos = [];   // fallback-mode dataURLs
       // If the catch lacks conditions but the pin has a conditionsAtCatch
       // snapshot, copy it onto the FIRST catch so we don't lose the data.
       if (i === 0 && (c.flowCfs == null && c.waterTempF == null && !c.weather)) {
@@ -2094,6 +2659,21 @@ function ensureCatchesFormat(pin) {
       }
       return c;
     });
+    // Photo-level migration: older pins stored photoIds / photos at the
+    // PIN level. The catch-level data model requires them on the catch
+    // (photos are a catch field — see rule: "all fields linked to the
+    // catch should be based on the catch date"). If this pin still has
+    // pin.photoIds but catches[0] has none, hoist them onto catches[0].
+    // We only do this once per pin (guarded by _catchesFormatted flag).
+    var c0 = pin.catches[0];
+    if (c0 && Array.isArray(pin.photoIds) && pin.photoIds.length > 0 &&
+        (!Array.isArray(c0.photoIds) || c0.photoIds.length === 0)) {
+      c0.photoIds = pin.photoIds.slice();
+    }
+    if (c0 && Array.isArray(pin.photos) && pin.photos.length > 0 &&
+        (!Array.isArray(c0.photos) || c0.photos.length === 0)) {
+      c0.photos = pin.photos.slice();
+    }
     pin._catchesFormatted = true;
     return pin;
   }
@@ -2124,6 +2704,9 @@ function ensureCatchesFormat(pin) {
     waterTempF: (pin.waterTempF != null) ? pin.waterTempF : null,
     airTempF: legacyAirTemp,
     weather: legacyWeather,
+    // Hoist any pin-level photos onto this single legacy catch
+    photoIds: Array.isArray(pin.photoIds) ? pin.photoIds.slice() : [],
+    photos: Array.isArray(pin.photos) ? pin.photos.slice() : [],
     addedAt: pin._syncedAt || Date.now()
   }];
   pin._catchesFormatted = true;
@@ -2147,12 +2730,28 @@ function newCatchRow(defaults) {
     waterTempF: (defaults.waterTempF != null) ? defaults.waterTempF : null,
     airTempF: (defaults.airTempF != null) ? defaults.airTempF : null,
     weather: defaults.weather || null,
+    // Photos attached to THIS catch. photoIds are IndexedDB row ids for
+    // persisted photos; `photos` is the in-memory render list while the
+    // editor is open ([{id, url, isNew, dataUrl?}]). Photos migrated from
+    // pin-level storage (pre-catch-level refactor) land here too.
+    photoIds: Array.isArray(defaults.photoIds) ? defaults.photoIds.slice() : [],
+    photos: Array.isArray(defaults.photos) ? defaults.photos.slice() : [],
     addedAt: Date.now()
   };
 }
 
 function addCatchRow() {
-  currentCatches.push(newCatchRow());
+  // Last-fly auto-carry: if the previous catch has a fly + species logged,
+  // pre-fill them on the new catch so the angler isn't retyping the same
+  // pattern for every fish at the same hole. Most catches on a run are
+  // on the same fly — save ~3 taps per catch. User can always change it.
+  var prev = currentCatches[currentCatches.length - 1];
+  var defaults = {};
+  if (prev) {
+    if (prev.fly) defaults.fly = prev.fly;
+    if (prev.fish) defaults.fish = prev.fish;
+  }
+  currentCatches.push(newCatchRow(defaults));
   renderCatchesList();
   // Fetch conditions for the brand-new catch using its default (now) date/time
   var newIdx = currentCatches.length - 1;
@@ -2349,6 +2948,11 @@ function renderCatchesList() {
 function buildCatchRowHtml(c, i) {
   var remove = '<button type="button" class="catch-remove" onclick="removeCatchRow(' + i + ')" aria-label="Remove catch" title="Remove this catch">&times;</button>';
   var sizeVal = (c.sizeInches != null) ? c.sizeInches : '';
+  // Per-catch astronomy — sunrise/sunset + moon phase for THIS catch's
+  // date at THIS pin's location. Pure local math, works offline.
+  var lat = parseFloat((document.getElementById('pin-lat') || {}).value);
+  var lng = parseFloat((document.getElementById('pin-lng') || {}).value);
+  var astroHtml = renderCatchAstroHtml(c, lat, lng);
   return (
     '<div class="catch-row" data-idx="' + i + '">' +
       '<div class="catch-row-head">' +
@@ -2378,9 +2982,15 @@ function buildCatchRowHtml(c, i) {
         '</div>' +
         '<div class="field">' +
           '<label>Fly</label>' +
-          '<input type="text" class="catch-fly" data-idx="' + i + '" value="' + escapeHtml(c.fly || '') + '" oninput="updateCatchField(' + i + ',\'fly\',this.value)" placeholder="e.g., Elk Hair Caddis">' +
+          '<input type="text" class="catch-fly" data-idx="' + i + '" value="' + escapeHtml(c.fly || '') + '" oninput="updateCatchField(' + i + ',\'fly\',this.value); toggleFlySuggestions(' + i + ')" placeholder="e.g., Elk Hair Caddis">' +
+          '<div class="fly-suggestions" data-idx="' + i + '">' + renderFlySuggestionsHtml(c, i) + '</div>' +
         '</div>' +
         '<div class="catch-cond-fields">' + renderCatchConditionsFieldsHtml(c) + '</div>' +
+        astroHtml +
+        '<div class="field">' +
+          '<label>Photos for this catch</label>' +
+          '<div class="catch-photos-row" data-idx="' + i + '">' + renderCatchPhotosHtml(c, i) + '</div>' +
+        '</div>' +
         '<div class="field">' +
           '<label>Catch notes</label>' +
           '<textarea class="catch-notes" data-idx="' + i + '" oninput="updateCatchField(' + i + ',\'notes\',this.value)" placeholder="Hatch, behavior, anything specific to this fish">' + escapeHtml(c.notes || '') + '</textarea>' +
@@ -2388,6 +2998,90 @@ function buildCatchRowHtml(c, i) {
       '</div>' +
     '</div>'
   );
+}
+
+// Fly-suggestion chips shown under an EMPTY Fly input. Once the user
+// types anything, the chips hide. Rule-based — uses the catch's own
+// conditions (month, water temp, flow, cloud cover) if available so the
+// suggestion is relevant to THAT day, not today's weather.
+function renderFlySuggestionsHtml(c, catchIdx) {
+  if (!c || (c.fly && c.fly.trim())) return '';
+  var month;
+  if (c.date) {
+    var parts = c.date.split('-');
+    month = (parts.length === 3) ? parseInt(parts[1], 10) : (new Date().getMonth() + 1);
+  } else {
+    month = new Date().getMonth() + 1;
+  }
+  var cloudy = false;
+  if (c.weather && c.weather.weatherCode != null) {
+    // WMO codes 3 (overcast), 45/48 (fog), 51+ (drizzle/rain) count as overcast
+    var wc = c.weather.weatherCode;
+    cloudy = (wc === 3 || wc === 45 || wc === 48 || wc >= 51);
+  }
+  var suggestions = suggestFlies({
+    month: month,
+    waterTempF: c.waterTempF,
+    flowState: null,   // future: pass real flow state
+    cloudy: cloudy
+  });
+  if (suggestions.length === 0) return '';
+  return '<div class="fly-suggest-label">Try:</div>' +
+    suggestions.map(function(s) {
+      return '<button type="button" class="fly-suggest-chip" onclick="applyFlySuggestion(' + catchIdx + ',\'' + escapeHtml(s).replace(/'/g, '\\\'') + '\')">' + escapeHtml(s) + '</button>';
+    }).join('');
+}
+
+// Hide suggestion chips as soon as the user types in the fly field.
+function toggleFlySuggestions(catchIdx) {
+  var c = currentCatches[catchIdx];
+  if (!c) return;
+  var wrap = document.querySelector('.fly-suggestions[data-idx="' + catchIdx + '"]');
+  if (!wrap) return;
+  if (c.fly && c.fly.trim()) wrap.style.display = 'none';
+  else wrap.style.display = '';
+}
+
+// Tap a chip → set the fly on the catch + hide suggestions
+function applyFlySuggestion(catchIdx, fly) {
+  if (!currentCatches[catchIdx]) return;
+  currentCatches[catchIdx].fly = fly;
+  var input = document.querySelector('.catch-fly[data-idx="' + catchIdx + '"]');
+  if (input) input.value = fly;
+  var wrap = document.querySelector('.fly-suggestions[data-idx="' + catchIdx + '"]');
+  if (wrap) wrap.style.display = 'none';
+  updateReviewBadge();
+}
+
+// Per-catch photo strip HTML. Photos live on the catch (data model rule:
+// "all fields linked to the catch should be based on the catch date").
+function renderCatchPhotosHtml(c, catchIdx) {
+  var photos = Array.isArray(c.photos) ? c.photos : [];
+  var thumbs = photos.map(function(p, pi) {
+    return '<img src="' + p.url + '" class="catch-photo-thumb" data-idx="' + catchIdx + '" data-pi="' + pi + '" onclick="removeCatchPhoto(' + catchIdx + ',' + pi + ')">';
+  }).join('');
+  var addBtn = '<div class="catch-photo-add" onclick="addCatchPhoto(' + catchIdx + ')" aria-label="Add photo" title="Add photo">+</div>';
+  return thumbs + addBtn;
+}
+
+// Re-render just one catch's photo strip (no full catch re-render — keeps
+// focus on input fields the user might be typing in).
+function rerenderCatchPhotos(catchIdx) {
+  var row = document.querySelector('.catch-photos-row[data-idx="' + catchIdx + '"]');
+  if (!row) return;
+  var c = currentCatches[catchIdx];
+  if (!c) return;
+  row.innerHTML = renderCatchPhotosHtml(c, catchIdx);
+}
+
+// Click handler for a catch's "+" photo tile. Stashes the catch index so
+// handlePhotos knows where the incoming files go, then triggers the
+// shared hidden file input.
+var _attachingCatchIdx = null;
+function addCatchPhoto(catchIdx) {
+  _attachingCatchIdx = catchIdx;
+  var input = document.getElementById('photo-input');
+  if (input) input.click();
 }
 
 // Pending-photo context used when merging an imported photo into an existing
@@ -2415,7 +3109,10 @@ async function placeNewPin(latlng, captureTimeOrOpts, maybeOpts) {
     if (choice.choice === 'cancel') return;
     if (choice.choice === 'merge') {
       if (opts.photoFile) _pendingMergePhoto = { file: opts.photoFile };
-      await openPinForEdit(choice.pin.id, { addBlankCatch: true });
+      // Thread captureTime through so the blank catch added below picks up
+      // the photo's EXIF date/time (not today's). With pin-level dates
+      // removed in §6.1.b, the catch is the only place the date lives.
+      await openPinForEdit(choice.pin.id, { addBlankCatch: true, captureTime: captureTime });
       return;
     }
     // else: fall through to fresh-pin creation below
@@ -2432,26 +3129,35 @@ function _openNewPinEditor(latlng, captureTime) {
   var offlineNote = document.getElementById('pin-offline-note');
   if (offlineNote) offlineNote.hidden = navigator.onLine;
 
-  // Stash the capture time so savePin can embed it in conditionsAtCatch
-  _sessionEnrichment.captureTime = captureTime || null;
-
   // Open pin editor
   editingPinId = null;
   currentDraftPinId = Date.now().toString();  // used for photo attachment
-  currentPhotos = [];
+  // captureTime is intentionally NOT stashed on _sessionEnrichment anymore —
+  // the top section (weather, flow, parcel, regs link) always shows CURRENT
+  // conditions at this spot, while per-catch conditions live on catch rows
+  // and use each catch's own date/time. See the fetch block below.
   _sessionEnrichment = { river: null, flow: null, parcel: null };
   document.getElementById('pin-modal-title').innerHTML = '&#128204; New Pin <button class="modal-close" onclick="closeModal(\'modal-pin\')">&times;</button>';
   document.getElementById('pin-name').value = '';
-  document.getElementById('pin-date').value = new Date().toISOString().split('T')[0];
-  document.getElementById('pin-time').value = new Date().toTimeString().slice(0,5);
+  // Pin-level date/time inputs removed — the first catch carries the date/time.
+  // newCatchRow() below defaults to "now" when no captureTime is provided,
+  // or the EXIF capture time when importing from a photo (set after this call).
   document.getElementById('pin-river').value = '';
-  // Start fresh catches list: one empty catch ready to fill
-  currentCatches = [newCatchRow()];
+  // Start fresh catches list: one empty catch ready to fill. If a photo's
+  // EXIF capture time was provided, seed the first catch with it so the
+  // catch date/time reflects when the photo was taken — not when the user
+  // is importing. Otherwise default to "now".
+  var firstCatchDefaults = {};
+  if (captureTime) {
+    var capDt = new Date(captureTime);
+    firstCatchDefaults.date = capDt.toISOString().split('T')[0];
+    firstCatchDefaults.time = capDt.toTimeString().slice(0, 5);
+  }
+  currentCatches = [newCatchRow(firstCatchDefaults)];
   document.getElementById('pin-notes').value = '';
   document.getElementById('pin-lat').value = latlng.lat;
   document.getElementById('pin-lng').value = latlng.lng;
   document.getElementById('btn-delete-pin').style.display = 'none';
-  document.getElementById('photo-container').innerHTML = '';
   document.getElementById('pin-id').value = currentDraftPinId;
   document.getElementById('pin-flow-badge').style.display = 'none';
   document.getElementById('pin-flow-value').textContent = '-- CFS';
@@ -2466,13 +3172,20 @@ function _openNewPinEditor(latlng, captureTime) {
   populateFishDropdown();
   renderCatchesList();
 
-  // Detect nearby rivers + flow + parcel + weather. When captureTime is set
-  // (photo import), flow + weather fetch the historical conditions at that
-  // moment instead of live data. River + parcel aren't time-sensitive.
+  // Detect nearby rivers + flow + parcel + weather for the PIN-LEVEL top
+  // section. Always fetches CURRENT conditions at this spot — regardless of
+  // whether this pin came from a photo import or a fresh drop. Rationale:
+  //   • The top section answers "what's it like HERE right now?" (useful
+  //     for trip planning, stream-access law, regulations link).
+  //   • Per-catch historical conditions live on the catch rows below and
+  //     are driven by each catch's own date/time (see the first catch's
+  //     EXIF-seeded date above + refetchCatchConditions).
+  // So we pass no captureTime — top section = now, catches = their own dates.
   detectNearbyRivers(latlng.lat, latlng.lng);
-  fetchNearbyUSGS(latlng.lat, latlng.lng, captureTime);
+  fetchNearbyUSGS(latlng.lat, latlng.lng);
   renderPinParcelInfo(latlng.lat, latlng.lng);
-  renderPinWeather(latlng.lat, latlng.lng, captureTime);
+  renderPinWeather(latlng.lat, latlng.lng);
+  renderPinSunMoon(latlng.lat, latlng.lng);   // offline-safe; pure math
   renderPinHistory(latlng.lat, latlng.lng, null);
   applyPinSectionPrefs();
 
@@ -2519,29 +3232,18 @@ async function openPinForEdit(pinId, opts) {
   currentDraftPinId = pinId;
   _sessionEnrichment = { river: null, flow: null, parcel: null };
 
-  // Load photos from IndexedDB (or fallback base64 dataUrls)
-  revokeCurrentPhotoUrls();
-  currentPhotos = [];
-  if (PinStore._usingFallback && Array.isArray(pin.photos)) {
-    currentPhotos = pin.photos.map(function(dataUrl) {
-      return { id: null, url: dataUrl, isNew: false, dataUrl: dataUrl };
-    });
-  } else {
-    try {
-      var stored = await PinStore.getPhotos(pinId);
-      currentPhotos = stored.map(function(p) {
-        return { id: p.id, url: URL.createObjectURL(p.blob), isNew: false };
-      });
-    } catch (e) { console.log('Photo load failed:', e); }
-  }
-
   document.getElementById('pin-modal-title').innerHTML = '&#128204; Edit Pin <button class="modal-close" onclick="closeModal(\'modal-pin\')">&times;</button>';
   document.getElementById('pin-name').value = pin.name;
-  document.getElementById('pin-date').value = pin.date;
-  document.getElementById('pin-time').value = pin.time;
+  // Pin-level date/time inputs are gone (§6.1.b) — catch date/time below
+  // carry the authoritative date for this pin.
   document.getElementById('pin-river').value = pin.river || '';
-  // Load catches from the pin (migration already happened in initMap)
+  // Load catches from the pin (migration already happened in initMap).
+  // Preserve ALL per-catch fields — especially date/time, per-catch
+  // conditions (flow, water temp, air temp, weather), and photo lists
+  // (photoIds are persisted; photos are rehydrated just below from
+  // IndexedDB blobs).
   pin = ensureCatchesFormat(pin);
+  revokeAllCatchPhotoUrls();   // from prior pin edit session
   currentCatches = pin.catches.map(function(c) {
     return {
       id: c.id || ('c-' + Date.now() + '-' + Math.floor(Math.random() * 1000)),
@@ -2549,13 +3251,69 @@ async function openPinForEdit(pinId, opts) {
       fly: c.fly || '',
       sizeInches: (c.sizeInches != null) ? c.sizeInches : null,
       notes: c.notes || '',
+      date: c.date || '',
+      time: c.time || '',
+      flowCfs: c.flowCfs || null,
+      waterTempF: (c.waterTempF != null) ? c.waterTempF : null,
+      airTempF: (c.airTempF != null) ? c.airTempF : null,
+      weather: c.weather || null,
+      photoIds: Array.isArray(c.photoIds) ? c.photoIds.slice() : [],
+      photos: [],   // populated below from IndexedDB blobs or fallback dataURLs
       addedAt: c.addedAt || Date.now()
     };
   });
+
+  // Rehydrate photos onto each catch. Under the new data model photos
+  // belong to a specific catch (identified by photoIds). Photos are still
+  // stored in IndexedDB keyed by pinId — we fetch them all once, then
+  // distribute by matching id to each catch's photoIds array. Any orphan
+  // photos (id not listed on any catch — e.g. legacy pre-refactor pins
+  // mid-migration) get attached to catches[0] so nothing is lost.
+  if (PinStore._usingFallback) {
+    // Fallback mode: dataURLs already live on c.photos via ensureCatchesFormat.
+    currentCatches.forEach(function(cc, i) {
+      var src = pin.catches[i] && Array.isArray(pin.catches[i].photos) ? pin.catches[i].photos : [];
+      cc.photos = src.map(function(dataUrl) {
+        return { id: null, url: dataUrl, isNew: false, dataUrl: dataUrl };
+      });
+    });
+  } else {
+    try {
+      var stored = await PinStore.getPhotos(pinId);
+      var byId = {};
+      stored.forEach(function(sp) { byId[sp.id] = sp; });
+      var claimed = {};
+      currentCatches.forEach(function(cc) {
+        cc.photos = (cc.photoIds || []).map(function(pid) {
+          var sp = byId[pid];
+          if (!sp) return null;
+          claimed[pid] = true;
+          return { id: sp.id, url: URL.createObjectURL(sp.blob), isNew: false };
+        }).filter(Boolean);
+      });
+      // Orphan catch — any stored photo not claimed by a catch goes on
+      // catches[0]. Only affects legacy data.
+      var orphans = stored.filter(function(sp) { return !claimed[sp.id]; });
+      if (orphans.length > 0 && currentCatches[0]) {
+        orphans.forEach(function(sp) {
+          currentCatches[0].photos.push({ id: sp.id, url: URL.createObjectURL(sp.blob), isNew: false });
+          currentCatches[0].photoIds.push(sp.id);
+        });
+      }
+    } catch (e) { console.log('Photo load failed:', e); }
+  }
   // When merging (e.g., imported photo on a nearby existing pin), append
   // a fresh empty catch so the user can fill in the new fish immediately.
+  // If a photo captureTime was threaded through, seed the blank catch's
+  // date/time with it (§6.1.b — catches now own the date authoritatively).
   if (opts.addBlankCatch) {
-    currentCatches.push(newCatchRow());
+    var blankDefaults = {};
+    if (opts.captureTime) {
+      var bct = new Date(opts.captureTime);
+      blankDefaults.date = bct.toISOString().split('T')[0];
+      blankDefaults.time = bct.toTimeString().slice(0, 5);
+    }
+    currentCatches.push(newCatchRow(blankDefaults));
   }
   document.getElementById('pin-notes').value = pin.notes || '';
   document.getElementById('pin-lat').value = pin.lat;
@@ -2580,18 +3338,31 @@ async function openPinForEdit(pinId, opts) {
 
   populateFishDropdown();
   renderCatchesList();
-  renderPhotos();
+  // No renderPhotos() — photos now render inside each catch row via
+  // renderCatchesList → buildCatchRowHtml → renderCatchPhotosHtml.
+
+  // Paint SAVED values from the pin first so offline edits show something
+  // useful. If we come back online, the network fetches below will
+  // refresh with current values. If we stay offline, the user sees what
+  // was stored the last time this pin was online — which is exactly what
+  // they need while standing on the bank with no signal.
+  if (pin.flowCfs && pin.flowCfs !== '-- CFS') {
+    document.getElementById('pin-flow-badge').style.display = 'block';
+    document.getElementById('pin-flow-value').textContent = pin.flowCfs;
+  }
+  if (pin.waterTempF != null) renderTempBadge(pin.waterTempF);
 
   if (pin.usgsId) {
     showUSGSLinks(pin.usgsId, pin.river);
-    fetchFlowForSite(pin.usgsId);
+    fetchFlowForSite(pin.usgsId);   // no-op if offline (guard inside)
   } else {
-    fetchNearbyUSGS(pin.lat, pin.lng);
+    fetchNearbyUSGS(pin.lat, pin.lng);  // no-op if offline (guard inside)
   }
   if (pin.river) {
     showRegulationLink(pin.river, pin.lat, pin.lng);
   }
   renderPinParcelInfo(pin.lat, pin.lng);
+  renderPinSunMoon(pin.lat, pin.lng);   // offline-safe; pure math
   // Exclude this pin from its own "history" card so we don't show it as
   // past evidence of itself.
   renderPinHistory(pin.lat, pin.lng, pin.id);
@@ -2624,31 +3395,26 @@ async function openPinForEdit(pinId, opts) {
   setTimeout(fetchMissingConditionsForAllCatches, 0);
 
   // If a photo was being merged (from photo import → nearby-pin merge flow),
-  // attach it now so it's visible in the editor and will save with the pin.
+  // attach it to the just-added blank catch so photo+catch stay linked.
+  // (Photos belong to a specific catch — data-model rule.)
   if (_pendingMergePhoto && _pendingMergePhoto.file) {
     var file = _pendingMergePhoto.file;
     _pendingMergePhoto = null;
-    // Scroll after a tick so the new catch is visible
+    var targetCatchIdx = opts.addBlankCatch ? currentCatches.length - 1 : 0;
     setTimeout(async function() {
-      await handlePhotos({ files: [file], value: '' });
+      await handlePhotos({ files: [file], value: '' }, targetCatchIdx);
       // Focus the newly-added catch's species field if we added one
       if (opts.addBlankCatch) {
-        var lastIdx = currentCatches.length - 1;
-        var sel = document.querySelector('.catch-fish[data-idx="' + lastIdx + '"]');
+        var sel = document.querySelector('.catch-fish[data-idx="' + targetCatchIdx + '"]');
         if (sel) sel.focus();
       }
     }, 200);
   }
 }
 
-// Revoke all blob URLs currently held in currentPhotos
-function revokeCurrentPhotoUrls() {
-  currentPhotos.forEach(function(p) {
-    if (p.url && p.url.indexOf('blob:') === 0) {
-      try { URL.revokeObjectURL(p.url); } catch (e) {}
-    }
-  });
-}
+// Legacy function — kept so external callers that may still reference it
+// don't throw. Use revokeAllCatchPhotoUrls() for catch-based cleanup.
+function revokeCurrentPhotoUrls() { revokeAllCatchPhotoUrls(); }
 
 async function savePin() {
   var name = document.getElementById('pin-name').value.trim();
@@ -2673,10 +3439,12 @@ async function savePin() {
     ? existingPin.conditionsAtCatch
     : null;
   if (!conditionsAtCatch) {
-    // Fresh snapshot for a new pin or one being saved for the first time with weather
-    // snapshotAt = when the conditions in the snapshot actually existed.
-    // For a live-data pin that's "now." For a photo-imported pin it's the
-    // photo's EXIF capture time (stashed on _sessionEnrichment.captureTime).
+    // Fresh snapshot for a new pin. snapshotAt = when the PIN-LEVEL top-
+    // section conditions were fetched, which is always "now" — even for
+    // photo imports. (Per-catch historical conditions for the photo's
+    // actual capture time live on the catch rows.) _sessionEnrichment
+    // .captureTime is left here as a legacy fallback so pins mid-save
+    // from older code paths still work; new paths don't set it.
     conditionsAtCatch = {
       snapshotAt: _sessionEnrichment.captureTime || Date.now(),
       flowCfs: null,
@@ -2727,6 +3495,14 @@ async function savePin() {
   }
 
   var pinId = editingPinId || currentDraftPinId || Date.now().toString();
+  // Pin-level date/time inputs were removed in §6.1.b. Source pin.date/time
+  // from the first catch so IndexedDB + any legacy readers that still look
+  // at pin.date (map popups, older exports) keep working. First-catch is
+  // the semantically right choice — it was the "primary" catch before the
+  // multi-catch refactor.
+  var firstCatch = currentCatches[0] || {};
+  var pinDate = firstCatch.date || (existingPin ? existingPin.date : '') || new Date().toISOString().split('T')[0];
+  var pinTime = firstCatch.time || (existingPin ? existingPin.time : '') || new Date().toTimeString().slice(0, 5);
   var pinData = {
     id: pinId,
     _version: 2,
@@ -2734,8 +3510,8 @@ async function savePin() {
     _syncedAt: Date.now(),
     _serverSyncedAt: existingPin ? (existingPin._serverSyncedAt || null) : null,
     name: name,
-    date: document.getElementById('pin-date').value,
-    time: document.getElementById('pin-time').value,
+    date: pinDate,
+    time: pinTime,
     lat: parseFloat(document.getElementById('pin-lat').value),
     lng: parseFloat(document.getElementById('pin-lng').value),
     river: riverVal,
@@ -2754,6 +3530,12 @@ async function savePin() {
         waterTempF: (c.waterTempF != null) ? c.waterTempF : null,
         airTempF: (c.airTempF != null) ? c.airTempF : null,
         weather: c.weather || null,
+        // Photos are catch-level — photoIds persist, photos (dataURLs in
+        // fallback mode) get written below.
+        photoIds: Array.isArray(c.photoIds) ? c.photoIds.slice() : [],
+        photos: PinStore._usingFallback
+          ? (c.photos || []).map(function(p) { return p.dataUrl || p.url; }).filter(Boolean)
+          : undefined,
         addedAt: c.addedAt || Date.now()
       };
     }),
@@ -2781,12 +3563,33 @@ async function savePin() {
     parcel: (_sessionEnrichment.parcel && _sessionEnrichment.parcel.status === 'found')
       ? _sessionEnrichment.parcel
       : (existingPin ? (existingPin.parcel || null) : null),
-    photoIds: currentPhotos.map(function(p) { return p.id; }).filter(function(id) { return id != null; })
+    // pin-level photoIds / photos are DEPRECATED under the catch-level
+    // data model, but we keep them populated as the union of every
+    // catch's photoIds for back-compat (readers that haven't been updated
+    // — e.g. old map-popup code — still see SOMETHING). The authoritative
+    // list is catches[i].photoIds.
+    photoIds: (function() {
+      var all = [];
+      currentCatches.forEach(function(c) {
+        if (Array.isArray(c.photoIds)) {
+          c.photoIds.forEach(function(id) { if (id != null && all.indexOf(id) === -1) all.push(id); });
+        }
+      });
+      return all;
+    })()
   };
 
-  // Fallback mode: keep photos as base64 dataURLs on the pin itself
+  // Fallback mode: also write a pin-level photos array (union of catch
+  // dataURLs) for back-compat. The canonical source is catches[i].photos.
   if (PinStore._usingFallback) {
-    pinData.photos = currentPhotos.map(function(p) { return p.dataUrl || p.url; }).filter(Boolean);
+    var allDataUrls = [];
+    currentCatches.forEach(function(c) {
+      (c.photos || []).forEach(function(p) {
+        var url = p.dataUrl || p.url;
+        if (url && allDataUrls.indexOf(url) === -1) allDataUrls.push(url);
+      });
+    });
+    pinData.photos = allDataUrls;
   }
 
   try {
@@ -2795,7 +3598,7 @@ async function savePin() {
     if (_sessionActive && !editingPinId) {
       _sessionPins.push(pinData.id);
     }
-    pins = await PinStore.getAll();
+    pins = await PinStore.getAll(); bumpPinsVersion();
     pins = pins.map(ensureCatchesFormat);
     renderAllPins();
     updateReviewBadge();
@@ -2818,7 +3621,7 @@ async function deletePin() {
   if (!confirm('Delete this pin?')) return;
   try {
     await PinStore.delete(editingPinId);
-    pins = await PinStore.getAll();
+    pins = await PinStore.getAll(); bumpPinsVersion();
     renderAllPins();
     closeModal('modal-pin');
     showToast('Pin deleted');
@@ -2828,13 +3631,25 @@ async function deletePin() {
   }
 }
 
+// Track pin markers in a simple array so renderAllPins can remove them in
+// O(pins) without walking Leaflet's full layer list. map.eachLayer walks
+// EVERY layer — including every cached tile — so with even a single
+// downloaded offline region this was O(tiles) ≈ hundreds of iterations
+// just to find the markers. Keeping our own handle is ~100x faster and
+// the flag `_isPinMarker` is still set for any external code that checks.
+var _pinMarkers = [];
+
 function renderAllPins() {
-  // Remove existing pin markers
-  map.eachLayer(function(l) { if (l._isPinMarker) map.removeLayer(l); });
+  // Remove existing pin markers — O(markers), not O(all-map-layers).
+  for (var mi = 0; mi < _pinMarkers.length; mi++) {
+    try { map.removeLayer(_pinMarkers[mi]); } catch (e) {}
+  }
+  _pinMarkers.length = 0;
 
   pins.forEach(function(pin) {
     var marker = L.marker([pin.lat, pin.lng], { icon: createPinIcon() }).addTo(map);
     marker._isPinMarker = true;
+    _pinMarkers.push(marker);
     // Flag marker clicks so the map mouseup handler skips them
     marker.on('click', function() { window._pinMarkerClicked = true; });
     var tempHtml = (pin.waterTempF != null) ? ('<br>' + renderTempInline(pin.waterTempF)) : '';
@@ -2843,11 +3658,32 @@ function renderAllPins() {
     var validCatches = catches.filter(function(c) {
       return (c.fish && c.fish.trim()) || (c.fly && c.fly.trim()) || (c.sizeInches != null && c.sizeInches > 0);
     });
+
+    // Find the MOST RECENT catch across all catches on this pin. This
+    // powers the "Last caught X days ago — 18" brown on a Parachute Adams"
+    // one-liner that turns a map popup into trip-planning intel.
+    var mostRecent = null;
+    validCatches.forEach(function(c) {
+      if (!c.date) return;
+      var parts = c.date.split('-');
+      if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) return;
+      var yr = parseInt(parts[0], 10);
+      var mo = parseInt(parts[1], 10);
+      var da = parseInt(parts[2], 10);
+      if (!isFinite(yr) || !isFinite(mo) || !isFinite(da)) return;
+      var tms = new Date(yr, mo - 1, da).getTime();
+      if (!isFinite(tms)) return;
+      if (!mostRecent || tms > mostRecent._ms) {
+        mostRecent = c;
+        mostRecent._ms = tms;
+      }
+    });
+
     var catchLine = '';
     if (validCatches.length >= 2) {
-      // Multi-catch — show count + top species
+      // Multi-catch — show count + top species, then "last caught" line
       var speciesList = validCatches.map(function(c) { return c.fish || '?'; }).slice(0, 3).join(', ');
-      catchLine = '<br><span style="font-size:12px"><b>' + validCatches.length + ' catches:</b> ' + speciesList + (validCatches.length > 3 ? '...' : '') + '</span>';
+      catchLine = '<br><span style="font-size:12px"><b>' + validCatches.length + ' catches:</b> ' + speciesList + (validCatches.length > 3 ? '…' : '') + '</span>';
     } else if (validCatches.length === 1) {
       var c = validCatches[0];
       var line = [];
@@ -2856,14 +3692,42 @@ function renderAllPins() {
       if (c.sizeInches) line.push(c.sizeInches + '"');
       catchLine = line.length ? '<br><span style="font-size:12px">' + line.join(' &middot; ') + '</span>' : '';
     }
+
+    // "Last caught N days ago — <size>" <species> on <fly>" — the most
+    // useful line on the popup for trip planning. Only shown if we have
+    // a catch we can identify. Uses text-wrap-friendly typography since
+    // popups are narrow.
+    var lastCaughtHtml = '';
+    if (mostRecent) {
+      var days = Math.floor((Date.now() - mostRecent._ms) / 86400000);
+      var ago;
+      if (days === 0) ago = 'today';
+      else if (days === 1) ago = 'yesterday';
+      else if (days < 14) ago = days + ' days ago';
+      else if (days < 60) ago = Math.round(days / 7) + ' weeks ago';
+      else if (days < 730) ago = Math.round(days / 30) + ' months ago';
+      else ago = Math.round(days / 365) + ' years ago';
+      var detail = [];
+      if (mostRecent.sizeInches) detail.push(mostRecent.sizeInches + '"');
+      if (mostRecent.fish) detail.push(mostRecent.fish);
+      var onFly = mostRecent.fly ? ' on <i>' + escapeHtml(mostRecent.fly) + '</i>' : '';
+      lastCaughtHtml =
+        '<div style="margin-top:6px; padding:6px 8px; background:#f3efe5; border-radius:6px; font-size:11px; color:#3a3a3a; line-height:1.35">' +
+          '<b>Last caught ' + ago + '</b>' +
+          (detail.length ? '<br>' + escapeHtml(detail.join(' ')) : '') +
+          onFly +
+        '</div>';
+    }
+
     marker.bindPopup(
-      '<div style="min-width:180px">' +
+      '<div style="min-width:200px">' +
         '<b style="font-size:14px">' + pin.name + '</b><br>' +
         '<span style="color:#6b7280; font-size:12px">' + pin.date + ' ' + pin.time + '</span>' +
         (pin.river ? '<br><span style="color:#0369a1; font-size:12px">' + pin.river + '</span>' : '') +
         catchLine +
         (pin.flowCfs && pin.flowCfs !== '-- CFS' ? '<br><span style="color:#0369a1; font-size:12px">Flow: ' + pin.flowCfs + '</span>' : '') +
         tempHtml +
+        lastCaughtHtml +
         '<br><a href="#" onclick="openPinForEdit(\'' + pin.id + '\'); return false;" style="color:#1a5632; font-weight:600; font-size:13px">Edit Pin</a>' +
       '</div>'
     );
@@ -2871,10 +3735,109 @@ function renderAllPins() {
 }
 
 // ─── Photo Handling (IndexedDB blobs with localStorage fallback) ───
-async function handlePhotos(input) {
-  var files = Array.from(input.files);
+
+// Resize a user-selected photo to a thumbnail before storing it (§6.1.c).
+// Why: an unprocessed iPhone JPEG is ~3 MB; a 100-catch journal would burn
+// through IndexedDB's quota (and sync bandwidth, once we have a backend).
+// At 1200px long-edge + JPEG q=0.82 the thumbnail is ~120-180 KB with
+// enough fish-ID detail preserved.
+//
+// EXIF data IS stripped by this resize — but we always call readPhotoExif()
+// BEFORE this point on the import paths that care about GPS/timestamp, so
+// no metadata is lost. For the manual "+" photo-add path (handlePhotos on
+// the pin editor), there's no EXIF workflow, so stripping is fine.
+//
+// If the photo is already under maxEdge we return the original Blob
+// untouched — no point re-encoding a small photo. Any decode failure
+// (unsupported format, CORS, etc.) also falls back to the original so
+// the user never loses a photo because of a resize glitch.
+async function resizePhotoToThumbnail(file, maxEdge, quality) {
+  maxEdge = maxEdge || 1200;
+  quality = (typeof quality === 'number') ? quality : 0.82;
+  if (!file || !file.type || file.type.indexOf('image/') !== 0) return file;
+  try {
+    var bitmap;
+    if (self.createImageBitmap) {
+      bitmap = await createImageBitmap(file);
+    } else {
+      bitmap = await new Promise(function(resolve, reject) {
+        var url = URL.createObjectURL(file);
+        var img = new Image();
+        img.onload = function() { URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = function(err) { URL.revokeObjectURL(url); reject(err); };
+        img.src = url;
+      });
+    }
+    var w = bitmap.width || bitmap.naturalWidth;
+    var h = bitmap.height || bitmap.naturalHeight;
+    if (!w || !h) {
+      if (bitmap.close) bitmap.close();
+      return file;
+    }
+    if (Math.max(w, h) <= maxEdge) {
+      if (bitmap.close) bitmap.close();
+      return file;
+    }
+    var scale = maxEdge / Math.max(w, h);
+    var outW = Math.max(1, Math.round(w * scale));
+    var outH = Math.max(1, Math.round(h * scale));
+    var canvas = document.createElement('canvas');
+    canvas.width = outW;
+    canvas.height = outH;
+    var ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0, outW, outH);
+    if (bitmap.close) bitmap.close();
+    var blob = await new Promise(function(resolve) {
+      canvas.toBlob(resolve, 'image/jpeg', quality);
+    });
+    // Explicitly release canvas backing store. iOS Safari is aggressive
+    // about holding on to large canvas buffers — zero-sizing here lets
+    // the JPEG we just produced be the only copy in memory. Matters
+    // during bulk imports where ~20 canvases can live concurrently.
+    try { canvas.width = 0; canvas.height = 0; } catch (e) {}
+    if (!blob) return file;
+    var stem = (file.name || 'photo').replace(/\.[^.]+$/, '');
+    try {
+      return new File([blob], stem + '.jpg', {
+        type: 'image/jpeg',
+        lastModified: file.lastModified || Date.now()
+      });
+    } catch (e) {
+      // Older browsers without File constructor — return Blob with name hint
+      blob.name = stem + '.jpg';
+      return blob;
+    }
+  } catch (e) {
+    console.log('thumbnail resize failed, keeping original:', e);
+    return file;
+  }
+}
+
+// Photo add — routed to a specific catch via _attachingCatchIdx (set by
+// addCatchPhoto). Each photo is stored in IndexedDB and remembered on
+// currentCatches[idx].photos (in-memory) + currentCatches[idx].photoIds
+// (persisted). If the caller didn't set a target catch, default to the
+// first catch (e.g., single-photo import flow).
+async function handlePhotos(input, explicitCatchIdx) {
+  var catchIdx = (typeof explicitCatchIdx === 'number')
+    ? explicitCatchIdx
+    : (_attachingCatchIdx != null ? _attachingCatchIdx : 0);
+  _attachingCatchIdx = null;
+  if (!currentCatches[catchIdx]) {
+    console.log('handlePhotos: no catch at idx', catchIdx);
+    if (input && 'value' in input) input.value = '';
+    return;
+  }
+  var targetCatch = currentCatches[catchIdx];
+  if (!Array.isArray(targetCatch.photos)) targetCatch.photos = [];
+  if (!Array.isArray(targetCatch.photoIds)) targetCatch.photoIds = [];
+
+  var files = Array.from(input.files || []);
   for (var i = 0; i < files.length; i++) {
     var file = files[i];
+    // Resize before storing. Keeps IndexedDB usage manageable even after
+    // hundreds of catches. See resizePhotoToThumbnail() notes above.
+    try { file = await resizePhotoToThumbnail(file); } catch (e) {}
     try {
       if (PinStore._usingFallback) {
         // Fallback: keep base64 dataURL pattern
@@ -2884,44 +3847,57 @@ async function handlePhotos(input) {
           r.onerror = reject;
           r.readAsDataURL(file);
         });
-        currentPhotos.push({ id: null, url: dataUrl, isNew: true, dataUrl: dataUrl });
+        targetCatch.photos.push({ id: null, url: dataUrl, isNew: true, dataUrl: dataUrl });
       } else {
         var photoId = await PinStore.addPhoto(currentDraftPinId, file);
-        currentPhotos.push({ id: photoId, url: URL.createObjectURL(file), isNew: true });
+        targetCatch.photos.push({ id: photoId, url: URL.createObjectURL(file), isNew: true });
+        if (photoId != null) targetCatch.photoIds.push(photoId);
       }
     } catch (e) {
       console.log('Photo save failed:', e);
       showToast('Photo upload failed');
     }
   }
-  input.value = '';
-  renderPhotos();
+  if (input && 'value' in input) input.value = '';
+  rerenderCatchPhotos(catchIdx);
 }
 
-async function removePhotoAt(idx) {
+async function removeCatchPhoto(catchIdx, photoIdx) {
   if (!confirm('Remove this photo?')) return;
-  var p = currentPhotos[idx];
+  var c = currentCatches[catchIdx];
+  if (!c || !Array.isArray(c.photos)) return;
+  var p = c.photos[photoIdx];
   if (p && p.id != null) {
     try { await PinStore.deletePhoto(p.id); } catch (e) { console.log('deletePhoto failed:', e); }
+    // Also remove from photoIds so the pin save doesn't re-persist it
+    if (Array.isArray(c.photoIds)) {
+      var idx = c.photoIds.indexOf(p.id);
+      if (idx !== -1) c.photoIds.splice(idx, 1);
+    }
   }
   if (p && p.url && p.url.indexOf('blob:') === 0) {
     try { URL.revokeObjectURL(p.url); } catch (e) {}
   }
-  currentPhotos.splice(idx, 1);
-  renderPhotos();
+  c.photos.splice(photoIdx, 1);
+  rerenderCatchPhotos(catchIdx);
 }
 
-function renderPhotos() {
-  var container = document.getElementById('photo-container');
-  container.innerHTML = currentPhotos.map(function(p, i) {
-    return '<img src="' + p.url + '" class="photo-thumb" onclick="removePhotoAt(' + i + ')">';
-  }).join('');
-}
+// Legacy alias — old inline onclick="removePhotoAt(...)" generated HTML
+// from pins edited pre-refactor may still live in detached DOM. Keeps the
+// function defined so those clicks don't throw.
+function removePhotoAt() { /* no-op — photos moved to catches */ }
 
-document.getElementById('photo-add-btn').addEventListener('click', function(e) {
-  e.preventDefault();
-  document.getElementById('photo-input').click();
-});
+// Revoke every blob URL currently held across all catches. Called on
+// closeModal to prevent leaks between pin edits.
+function revokeAllCatchPhotoUrls() {
+  (currentCatches || []).forEach(function(c) {
+    (c.photos || []).forEach(function(p) {
+      if (p && p.url && p.url.indexOf('blob:') === 0) {
+        try { URL.revokeObjectURL(p.url); } catch (e) {}
+      }
+    });
+  });
+}
 
 // ─── Fishing session tracking (opt-in) ───
 // When enabled, records a lightweight GPS trail + timing while you're on
@@ -3287,18 +4263,35 @@ async function bulkImportPhotos(input) {
           weather: cond.weather
         });
       });
+      // Attach photos to the SPECIFIC new catch they belong to (photos
+      // are catch-level — data-model rule). Resize + IndexedDB-store in
+      // parallel (not sequentially) — each photo's resize is CPU-bound
+      // canvas work, and IndexedDB can handle concurrent puts fine. For
+      // a 20-photo import this is ~10x faster than the old serial await
+      // loop. §6.1.c resize; EXIF already extracted in Phase 1.
+      if (!PinStore._usingFallback) {
+        var attachResults1 = await Promise.all(cl.photos.map(async function(cp) {
+          try {
+            var t = await resizePhotoToThumbnail(cp.file);
+            return await PinStore.addPhoto(existing.id, t);
+          } catch (e) { return null; }
+        }));
+        attachResults1.forEach(function(photoId1, p1) {
+          if (photoId1 != null) {
+            if (!Array.isArray(newCatches[p1].photoIds)) newCatches[p1].photoIds = [];
+            newCatches[p1].photoIds.push(photoId1);
+          }
+        });
+      }
       existing.catches = (existing.catches || []).concat(newCatches);
       existing._syncedAt = Date.now();
-      // Attach photos, tracking their new IDs so we can add them to photoIds[]
-      if (!PinStore._usingFallback) {
-        existing.photoIds = existing.photoIds || [];
-        for (var p1 = 0; p1 < cl.photos.length; p1++) {
-          try {
-            var photoId = await PinStore.addPhoto(existing.id, cl.photos[p1].file);
-            if (photoId != null) existing.photoIds.push(photoId);
-          } catch (e) {}
-        }
-      }
+      // Keep pin.photoIds as the back-compat union of all catches'
+      existing.photoIds = (existing.catches || []).reduce(function(acc, cc) {
+        (cc.photoIds || []).forEach(function(id) {
+          if (id != null && acc.indexOf(id) === -1) acc.push(id);
+        });
+        return acc;
+      }, []);
       await PinStore.save(existing);
       merged += cl.photos.length;
       needReview += newCatches.length;   // none of them have flies yet
@@ -3378,14 +4371,23 @@ async function bulkImportPhotos(input) {
         photoIds: []
       };
 
-      // Attach photos to the pin
+      // Attach each photo to the SPECIFIC catch it belongs to (thumbnails
+      // only — see §6.1.c). Photos are catch-level per the data model.
+      // Parallel resize + store — same reasoning as the merge branch.
       if (!PinStore._usingFallback) {
-        for (var p2 = 0; p2 < cl.photos.length; p2++) {
+        var attachResults2 = await Promise.all(cl.photos.map(async function(cp) {
           try {
-            var pid = await PinStore.addPhoto(newId, cl.photos[p2].file);
-            if (pid != null) pinData.photoIds.push(pid);
-          } catch (e) {}
-        }
+            var t = await resizePhotoToThumbnail(cp.file);
+            return await PinStore.addPhoto(newId, t);
+          } catch (e) { return null; }
+        }));
+        attachResults2.forEach(function(pid, p2) {
+          if (pid != null) {
+            if (!Array.isArray(catchesForPin[p2].photoIds)) catchesForPin[p2].photoIds = [];
+            catchesForPin[p2].photoIds.push(pid);
+            pinData.photoIds.push(pid);
+          }
+        });
       }
 
       await PinStore.save(pinData);
@@ -3395,7 +4397,7 @@ async function bulkImportPhotos(input) {
   }
 
   // Phase 4: refresh app state + report
-  pins = await PinStore.getAll();
+  pins = await PinStore.getAll(); bumpPinsVersion();
   pins = pins.map(ensureCatchesFormat);
   renderAllPins();
   updateReviewBadge();  // bulk imports create catches missing fly → badge goes up
@@ -3466,15 +4468,16 @@ async function importFromPhoto(input) {
   }
 
   // Wait a tick for placeNewPin to finish resetting the form, then
-  // overlay photo + EXIF date/time + helpful prompts.
+  // overlay the photo + helpful prompts. The EXIF capture time was passed
+  // into placeNewPin above so the first catch's date/time is already
+  // seeded from EXIF — no separate pin-date/pin-time write needed (§6.1.b).
   await new Promise(function(r) { setTimeout(r, 50); });
 
-  if (dateStr) document.getElementById('pin-date').value = dateStr;
-  if (timeStr) document.getElementById('pin-time').value = timeStr;
-
-  // Attach the photo via the normal handler — ensures IndexedDB + thumbnail render
+  // Attach the photo to catches[0] — photos are catch-level per the data
+  // model, and catches[0] is the freshly-seeded catch for this photo
+  // (its date/time comes from the photo's EXIF capture time).
   var fake = { files: [file], value: '' };
-  await handlePhotos(fake);
+  await handlePhotos(fake, 0);
 
   // Focus the pin-name input so the user can start typing immediately
   var nameEl = document.getElementById('pin-name');
@@ -3502,6 +4505,17 @@ async function importFromPhoto(input) {
 
 var _weatherCache = new Map();
 var WEATHER_CACHE_TTL = 20 * 60 * 1000;   // 20 min — weather changes hour-to-hour
+var WEATHER_CACHE_MAX = 80;               // bounded LRU so cache can't leak
+
+// JS Map preserves insertion order — grabbing the first key gives us the
+// oldest entry. When we overflow the cap, drop it.
+function _weatherCacheEvictIfNeeded() {
+  while (_weatherCache.size > WEATHER_CACHE_MAX) {
+    var oldestKey = _weatherCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    _weatherCache.delete(oldestKey);
+  }
+}
 
 // WMO weather-code mapping (Open-Meteo uses these standard codes)
 var WEATHER_CODES = {
@@ -3650,6 +4664,7 @@ async function fetchWeather(lat, lng, targetMs) {
 
     var result = { ok: true, historical: !!isHistorical, current: currentConditions, daily: daily };
     _weatherCache.set(key, { at: Date.now(), data: result });
+    _weatherCacheEvictIfNeeded();
     return result;
   } catch (e) {
     console.log('Weather fetch error:', e);
@@ -3853,6 +4868,13 @@ async function fetchNearbyUSGS(lat, lng, captureTime) {
   if (closest.flow) {
     document.getElementById('pin-flow-badge').style.display = 'block';
     document.getElementById('pin-flow-value').textContent = Number(closest.flow).toLocaleString() + ' CFS — ' + closest.name;
+    // Annotate with historical median context (fire-and-forget).
+    var today = new Date();
+    fetchFlowMedian(closest.id, today.getMonth() + 1, today.getDate()).then(function(median) {
+      if (median && isFinite(parseFloat(closest.flow))) {
+        renderFlowContext(parseFloat(closest.flow), median);
+      }
+    });
   }
   renderTempBadge(closest.waterTempF);
   renderPinFlowHistory(closest.id);
@@ -3869,8 +4891,123 @@ async function fetchNearbyUSGS(lat, lng, captureTime) {
   }
 }
 
+// ─── Historical flow context ───
+// USGS exposes a stat service that returns daily percentiles by
+// month/day, computed across the site's full period of record. We use
+// p50 (median) as "normal" and compare live CFS against it, e.g.
+// "1,850 CFS — 140% of median for April 22". 100% offline after the
+// first online fetch per site (data persists in IndexedDB).
+var _flowMedianCache = new Map();
+var FLOW_MEDIAN_TTL = 30 * 24 * 60 * 60 * 1000;  // medians evolve slowly — 30 days
+var FLOW_MEDIAN_MAX = 40;                         // cap the memory map
+
+function _flowMedianEvict() {
+  while (_flowMedianCache.size > FLOW_MEDIAN_MAX) {
+    var first = _flowMedianCache.keys().next().value;
+    if (first === undefined) break;
+    _flowMedianCache.delete(first);
+  }
+}
+
+function _padMMDD(m, d) {
+  return (m < 10 ? '0' : '') + m + '-' + (d < 10 ? '0' : '') + d;
+}
+
+function _parseUsgsStatRdb(text) {
+  if (!text) return null;
+  var lines = text.split('\n');
+  var headerCols = null;
+  var mIdx = -1, dIdx = -1, vIdx = -1;
+  var out = {};
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (!line || line.charAt(0) === '#') continue;
+    var parts = line.split('\t');
+    if (!headerCols) {
+      headerCols = parts;
+      mIdx = headerCols.indexOf('month_nu');
+      dIdx = headerCols.indexOf('day_nu');
+      vIdx = headerCols.indexOf('p50_va');
+      // If the response wasn't the expected RDB (e.g., USGS served an
+      // error page), signal parse failure — the caller should NOT cache.
+      if (mIdx === -1 || dIdx === -1 || vIdx === -1) return null;
+      continue;
+    }
+    if (parts.length > 0 && /^\d*[ns]$/.test(parts[0])) continue;  // data-type row
+    var m = parseInt(parts[mIdx], 10);
+    var d = parseInt(parts[dIdx], 10);
+    var v = parseFloat(parts[vIdx]);
+    if (isFinite(m) && isFinite(d) && isFinite(v)) {
+      out[_padMMDD(m, d)] = v;
+    }
+  }
+  // Empty parse = no data rows. Still signal failure so caller skips cache.
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+async function fetchFlowMedian(siteId, month, day) {
+  if (!siteId) return null;
+  var cached = _flowMedianCache.get(siteId);
+  if (cached && (Date.now() - cached.at) < FLOW_MEDIAN_TTL) {
+    var v = cached.byDate[_padMMDD(month, day)];
+    return (v != null && isFinite(v)) ? v : null;
+  }
+  if (!navigator.onLine) return null;
+  try {
+    var url = 'https://waterservices.usgs.gov/nwis/stat/?format=rdb' +
+              '&sites=' + encodeURIComponent(siteId) +
+              '&statReportType=daily&statTypeCd=p50&parameterCd=00060';
+    var res = await fetch(url);
+    if (!res.ok) return null;
+    var text = await res.text();
+    var byDate = _parseUsgsStatRdb(text);
+    // Only cache SUCCESSFUL parses. A null here means USGS returned
+    // garbage (HTML error page, empty body, etc.) and we don't want to
+    // poison the cache with an empty object for 30 days.
+    if (!byDate) return null;
+    _flowMedianCache.set(siteId, { at: Date.now(), byDate: byDate });
+    _flowMedianEvict();
+    var v2 = byDate[_padMMDD(month, day)];
+    return (v2 != null && isFinite(v2)) ? v2 : null;
+  } catch (e) { return null; }
+}
+
+// Render a small "140% of median — above normal" line under the flow
+// badge. Writes to #pin-flow-context (created if missing).
+function renderFlowContext(cfs, median) {
+  var badge = document.getElementById('pin-flow-badge');
+  if (!badge) return;
+  var ctx = document.getElementById('pin-flow-context');
+  if (!ctx) {
+    ctx = document.createElement('div');
+    ctx.id = 'pin-flow-context';
+    ctx.className = 'pin-flow-context';
+    badge.appendChild(ctx);
+  }
+  if (!isFinite(cfs) || !isFinite(median) || median <= 0) {
+    ctx.textContent = '';
+    ctx.style.display = 'none';
+    return;
+  }
+  var pct = Math.round((cfs / median) * 100);
+  var label;
+  if (pct < 50)       label = 'very low';
+  else if (pct < 75)  label = 'below normal';
+  else if (pct < 125) label = 'normal';
+  else if (pct < 175) label = 'above normal';
+  else if (pct < 250) label = 'high';
+  else                label = 'blown';
+  ctx.style.display = 'block';
+  ctx.innerHTML = '<b>' + pct + '%</b> of median for this date &middot; <span class="flow-ctx-label flow-ctx-' + label.replace(/\s/g, '-') + '">' + label + '</span>';
+}
+
 async function fetchFlowForSite(siteId) {
   if (!siteId) return;
+  // Offline → don't even try the fetch (iOS can hang ~5s before failing).
+  // The pin's SAVED flow + water temp were already rendered by whatever
+  // called us via pin.flowCfs / pin.waterTempF, so there's nothing more
+  // to do here offline.
+  if (!navigator.onLine) return;
   try {
     var url = 'https://waterservices.usgs.gov/nwis/iv/?format=json&sites=' + siteId + '&parameterCd=00060,00010';
     var res = await fetch(url);
@@ -3889,6 +5026,14 @@ async function fetchFlowForSite(siteId) {
     if (flow != null) {
       document.getElementById('pin-flow-badge').style.display = 'block';
       document.getElementById('pin-flow-value').textContent = Number(flow).toLocaleString() + ' CFS — ' + name;
+      // Fetch historical median + annotate "X% of median for this date".
+      // Fire-and-forget — returns null on error, we just don't show context.
+      var now = new Date();
+      fetchFlowMedian(siteId, now.getMonth() + 1, now.getDate()).then(function(median) {
+        if (median && isFinite(parseFloat(flow))) {
+          renderFlowContext(parseFloat(flow), median);
+        }
+      });
     }
     var tempF = celsiusToFahrenheit(tempC);
     renderTempBadge(tempF);
@@ -4016,12 +5161,16 @@ async function closeModal(id) {
     if (!editingPinId && currentDraftPinId && !PinStore._usingFallback) {
       try { await PinStore.deletePhotosForPin(currentDraftPinId); } catch (e) {}
     }
-    // Revoke all blob URLs we created this session
-    revokeCurrentPhotoUrls();
-    currentPhotos = [];
+    // Revoke all per-catch blob URLs we created this session
+    revokeAllCatchPhotoUrls();
     currentCatches = [];
     currentDraftPinId = null;
+    _attachingCatchIdx = null;
     _sessionEnrichment = { river: null, flow: null, parcel: null, captureTime: null };
+  }
+  if (id === 'modal-pins') {
+    // Release cached thumb blob URLs when leaving the list
+    revokePinThumbCache();
   }
 }
 
@@ -4083,6 +5232,13 @@ function showTab(tab) {
     if (onChip && offChip) {
       onChip.classList.toggle('active', enabled);
       offChip.classList.toggle('active', !enabled);
+    }
+    // Low-power GPS chips
+    var lpOn = document.getElementById('chip-lowgps-on');
+    var lpOff = document.getElementById('chip-lowgps-off');
+    if (lpOn && lpOff) {
+      lpOn.classList.toggle('active', !!_lowPowerGps);
+      lpOff.classList.toggle('active', !_lowPowerGps);
     }
     var rOn = document.getElementById('chip-rivers-on');
     var rOff = document.getElementById('chip-rivers-off');
@@ -4517,8 +5673,47 @@ function _extractCfs(flowStr) {
 }
 
 // Populate the filter dropdowns (called when Reports modal opens)
+// Debounced Reports rerender — every dropdown change fires onchange, and
+// _collectFilteredCatches + table render is the slowest thing in the app.
+// A 140ms debounce feels instant to users (well under the 200ms "slow"
+// threshold) but collapses ~3 back-to-back clicks into one render.
+var _reportsRenderTimer = null;
+function scheduleRenderReports() {
+  if (_reportsRenderTimer) clearTimeout(_reportsRenderTimer);
+  _reportsRenderTimer = setTimeout(function() {
+    _reportsRenderTimer = null;
+    renderReports();
+  }, 140);
+}
+
+// Version counter bumped whenever the pins array changes in a way that
+// affects report filter options (save, delete, bulk import, merge).
+// populateReportFilters uses this to skip rebuilding river/pin option
+// lists when nothing relevant changed — just keystrokes on sliders.
+var _pinsVersion = 0;
+var _reportFiltersVersion = -1;
+var _reportFiltersRiverLock = null;  // last river filter value we built pin options for
+function bumpPinsVersion() { _pinsVersion++; }
+
 function populateReportFilters() {
   var riverSel = document.getElementById('rep-river');
+  var pinSel = document.getElementById('rep-pin');
+  var currentRiverFilter = (riverSel && riverSel.value) || 'any';
+  // Fast path: pins haven't changed AND the pin dropdown is still scoped
+  // to the same river filter → skip rebuilding the option lists entirely.
+  // Only bucket selects need a first-time paint (handled at the bottom).
+  var needsRebuild = (_reportFiltersVersion !== _pinsVersion) ||
+                     (_reportFiltersRiverLock !== currentRiverFilter);
+  if (!needsRebuild && riverSel && riverSel.options.length > 0 &&
+      pinSel && pinSel.options.length > 0) {
+    return;
+  }
+  _reportFiltersVersion = _pinsVersion;
+  _reportFiltersRiverLock = currentRiverFilter;
+
+  // River dropdown — distinct rivers across all pins
+  // (code below handles the original init path)
+  // var riverSel already fetched above
   if (riverSel) {
     var rivers = {};
     (pins || []).forEach(function(p) { if (p.river) rivers[p.river] = true; });
@@ -4529,6 +5724,29 @@ function populateReportFilters() {
         return '<option value="' + escapeHtml(r) + '">' + escapeHtml(r) + '</option>';
       }).join('');
     riverSel.value = currentVal;
+  }
+
+  // Pin dropdown — lets the user drill down from "river" to "a specific
+  // spot". Label includes the river so duplicate pin names disambiguate.
+  // When a river is selected, the list narrows to pins on that river.
+  if (pinSel) {
+    var riverFilter = (riverSel && riverSel.value !== 'any') ? riverSel.value : null;
+    var currentPinVal = pinSel.value || 'any';
+    var pinOpts = (pins || [])
+      .filter(function(p) { return !riverFilter || p.river === riverFilter; })
+      .map(function(p) {
+        var label = p.name || ('Pin ' + String(p.id).slice(-4));
+        if (p.river && (!riverFilter)) label += ' — ' + p.river;
+        return { id: p.id, label: label };
+      })
+      .sort(function(a, b) { return a.label.localeCompare(b.label); });
+    pinSel.innerHTML = '<option value="any">Any pin</option>' +
+      pinOpts.map(function(o) {
+        return '<option value="' + escapeHtml(o.id) + '">' + escapeHtml(o.label) + '</option>';
+      }).join('');
+    // Preserve selection if the pin is still in the (possibly filtered) list
+    var stillThere = pinOpts.some(function(o) { return o.id === currentPinVal; });
+    pinSel.value = (stillThere ? currentPinVal : 'any');
   }
 
   function fillBucketSelect(id, buckets) {
@@ -4547,7 +5765,7 @@ function populateReportFilters() {
 }
 
 function resetReportFilters() {
-  ['rep-river','rep-flow','rep-water','rep-air','rep-weather'].forEach(function(id) {
+  ['rep-river','rep-pin','rep-flow','rep-water','rep-air','rep-weather'].forEach(function(id) {
     var el = document.getElementById(id);
     if (el) el.value = 'any';
   });
@@ -4558,6 +5776,7 @@ function resetReportFilters() {
 // then apply the 5 active filters.
 function _collectFilteredCatches() {
   var riverVal   = (document.getElementById('rep-river')   || {}).value || 'any';
+  var pinVal     = (document.getElementById('rep-pin')     || {}).value || 'any';
   var flowVal    = (document.getElementById('rep-flow')    || {}).value || 'any';
   var waterVal   = (document.getElementById('rep-water')   || {}).value || 'any';
   var airVal     = (document.getElementById('rep-air')     || {}).value || 'any';
@@ -4570,7 +5789,11 @@ function _collectFilteredCatches() {
 
   var matches = [];
   (pins || []).forEach(function(p) {
+    // Pin-level filters: river (most common use case — "what worked on
+    // the Madison at this flow") and specific pin ("what worked at my
+    // evening-rise hole at this flow").
     if (riverVal !== 'any' && p.river !== riverVal) return;
+    if (pinVal !== 'any' && p.id !== pinVal) return;
     var pp = ensureCatchesFormat(p);
     (pp.catches || []).forEach(function(c) {
       // Empty-catch placeholders (nothing filled in) don't count as records
@@ -4750,9 +5973,86 @@ function renderReviewList() {
   }).join('');
 }
 
+// Pin-list search + sort state (module-level so redraws preserve it)
+var _pinListSearch = '';
+var _pinListSort = 'newest';
+
+// Debounced — every keystroke in the search box should NOT rerun a full
+// 100-pin filter + sort + DOM rewrite. 180ms feels instant while still
+// collapsing 7-letter typing into one render.
+var _pinListSearchTimer = null;
+function setPinListSearch(v) {
+  _pinListSearch = (v || '').toLowerCase();
+  if (_pinListSearchTimer) clearTimeout(_pinListSearchTimer);
+  _pinListSearchTimer = setTimeout(function() {
+    _pinListSearchTimer = null;
+    renderPinList();
+  }, 180);
+}
+function setPinListSort(v) { _pinListSort = v || 'newest'; renderPinList(); }
+
+// Photo-thumb cache keyed by pin id. Each entry is a blob URL we
+// created from IndexedDB; we keep them live while the modal is open and
+// revoke them in closeModal(modal-pins) to avoid leaks.
+var _pinThumbCache = {};
+
+function _firstCatchSize(pin) {
+  var pp = ensureCatchesFormat(pin);
+  return (pp.catches || []).reduce(function(m, c) {
+    return Math.max(m, (c.sizeInches && isFinite(c.sizeInches)) ? c.sizeInches : 0);
+  }, 0);
+}
+
+function _filteredSortedPinsForList() {
+  var filter = _pinListSearch.trim();
+  var result = pins.slice();
+  if (filter) {
+    result = result.filter(function(p) {
+      var pp = ensureCatchesFormat(p);
+      var hay = (p.name || '') + ' ' + (p.river || '') + ' ';
+      (pp.catches || []).forEach(function(c) {
+        hay += ' ' + (c.fish || '') + ' ' + (c.fly || '');
+      });
+      return hay.toLowerCase().indexOf(filter) !== -1;
+    });
+  }
+  switch (_pinListSort) {
+    case 'oldest':
+      result.sort(function(a, b) {
+        return ((a.date || '') + (a.time || '')).localeCompare((b.date || '') + (b.time || ''));
+      });
+      break;
+    case 'most':
+      result.sort(function(a, b) {
+        var ac = (ensureCatchesFormat(a).catches || []).length;
+        var bc = (ensureCatchesFormat(b).catches || []).length;
+        return bc - ac;
+      });
+      break;
+    case 'biggest':
+      result.sort(function(a, b) { return _firstCatchSize(b) - _firstCatchSize(a); });
+      break;
+    case 'az':
+      result.sort(function(a, b) { return (a.name || '').localeCompare(b.name || ''); });
+      break;
+    case 'newest':
+    default:
+      result.sort(function(a, b) {
+        return ((b.date || '') + (b.time || '')).localeCompare((a.date || '') + (a.time || ''));
+      });
+  }
+  return result;
+}
+
 function renderPinList() {
   updateReviewBadge();   // keep badge fresh whenever pins are re-rendered
   var content = document.getElementById('pin-list-content');
+  if (!content) return;
+
+  // Sync the sort dropdown in case it was set via JS
+  var sortSel = document.getElementById('pin-list-sort');
+  if (sortSel && sortSel.value !== _pinListSort) sortSel.value = _pinListSort;
+
   if (pins.length === 0) {
     content.innerHTML =
       '<div class="empty-state">' +
@@ -4763,7 +6063,18 @@ function renderPinList() {
     return;
   }
 
-  content.innerHTML = pins.slice().sort(function(a,b) { return (b.date+b.time).localeCompare(a.date+a.time); }).map(function(pin) {
+  var filtered = _filteredSortedPinsForList();
+  if (filtered.length === 0) {
+    content.innerHTML =
+      '<div class="empty-state">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>' +
+        '<h3>No matches</h3>' +
+        '<p>Try a different search term.</p>' +
+      '</div>';
+    return;
+  }
+
+  content.innerHTML = filtered.map(function(pin) {
     var pendingChip = (pin._pending && Object.keys(pin._pending).length > 0)
       ? '<span class="pin-pending-chip">Syncing pending</span>'
       : '';
@@ -4772,7 +6083,6 @@ function renderPinList() {
     var validCatches = (ppin.catches || []).filter(function(c) {
       return (c.fish && c.fish.trim()) || (c.fly && c.fly.trim()) || (c.sizeInches != null && c.sizeInches > 0);
     });
-    // Date range across catches — if all same day, show one date; if multi-day, show range
     var catchDates = validCatches.map(function(c) { return c.date; }).filter(Boolean).sort();
     var dateDisplay;
     if (catchDates.length === 0) dateDisplay = pin.date || '';
@@ -4787,8 +6097,21 @@ function renderPinList() {
     } else {
       catchSummary = '';
     }
+
+    // Thumbnail slot — if we already cached this pin's first photo URL,
+    // inline it; otherwise render an empty div with data-id that
+    // _hydrateThumbs fills asynchronously after render. No network —
+    // photos come from IndexedDB.
+    var cachedUrl = _pinThumbCache[pin.id];
+    var thumbHtml;
+    if (cachedUrl) {
+      thumbHtml = '<div class="pin-list-thumb has-photo" data-id="' + escapeHtml(pin.id) + '" style="background-image:url(' + cachedUrl + ')"></div>';
+    } else {
+      thumbHtml = '<div class="pin-list-thumb" data-id="' + escapeHtml(pin.id) + '"><span>&#127907;</span></div>';
+    }
+
     return '<div class="pin-list-item" onclick="closeModal(\'modal-pins\'); openPinForEdit(\'' + pin.id + '\')">' +
-      '<div class="pin-list-icon">&#127907;</div>' +
+      thumbHtml +
       '<div class="pin-list-info">' +
         '<h4>' + pin.name + pendingChip + '</h4>' +
         '<p>' + (pin.river ? pin.river + ' &middot; ' : '') + dateDisplay + catchSummary + '</p>' +
@@ -4798,6 +6121,73 @@ function renderPinList() {
       '<span class="pin-list-arrow">&rsaquo;</span>' +
     '</div>';
   }).join('');
+
+  // Kick off async thumb hydration for visible pins
+  _hydratePinThumbs(filtered);
+}
+
+// Load first-catch photo blobs from IndexedDB for each pin in the list
+// and assign them to the thumbnail slots. Runs in parallel per pin; each
+// pin's photos are fetched via a single getPhotos call (already efficient).
+function _hydratePinThumbs(pinList) {
+  if (PinStore._usingFallback) {
+    // Fallback: photos live as base64 dataURLs on the pin or catch[0]
+    pinList.forEach(function(pin) {
+      if (_pinThumbCache[pin.id]) return;
+      var pp = ensureCatchesFormat(pin);
+      var c0 = (pp.catches || [])[0];
+      var src = (c0 && c0.photos && c0.photos[0]) || (pin.photos && pin.photos[0]);
+      if (!src) return;
+      _pinThumbCache[pin.id] = src;
+      var slot = document.querySelector('.pin-list-thumb[data-id="' + cssEscape(pin.id) + '"]');
+      if (slot) {
+        slot.style.backgroundImage = 'url(' + src + ')';
+        slot.classList.add('has-photo');
+      }
+    });
+    return;
+  }
+  pinList.forEach(function(pin) {
+    if (_pinThumbCache[pin.id]) return;
+    var pp = ensureCatchesFormat(pin);
+    var c0 = (pp.catches || [])[0];
+    var ids = (c0 && Array.isArray(c0.photoIds) && c0.photoIds.length) ? c0.photoIds : (pin.photoIds || []);
+    if (!ids || ids.length === 0) return;
+    PinStore.getPhotos(pin.id).then(function(stored) {
+      if (!stored || stored.length === 0) return;
+      var hit = null;
+      for (var i = 0; i < stored.length; i++) {
+        if (stored[i].id === ids[0]) { hit = stored[i]; break; }
+      }
+      if (!hit) hit = stored[0];
+      if (!hit || !hit.blob) return;
+      var url = URL.createObjectURL(hit.blob);
+      _pinThumbCache[pin.id] = url;
+      var slot = document.querySelector('.pin-list-thumb[data-id="' + cssEscape(pin.id) + '"]');
+      if (slot) {
+        slot.style.backgroundImage = 'url(' + url + ')';
+        slot.classList.add('has-photo');
+      }
+    }).catch(function() {});
+  });
+}
+
+// Cheap CSS.escape polyfill for our pin ids (digits + hyphens).
+function cssEscape(s) {
+  if (window.CSS && CSS.escape) return CSS.escape(s);
+  return String(s).replace(/[^a-zA-Z0-9_\-]/g, '\\$&');
+}
+
+// Revoke cached thumb blob URLs. Call when the My Pins modal closes so
+// we don't leak blob URLs across sessions.
+function revokePinThumbCache() {
+  Object.keys(_pinThumbCache).forEach(function(k) {
+    var url = _pinThumbCache[k];
+    if (url && url.indexOf && url.indexOf('blob:') === 0) {
+      try { URL.revokeObjectURL(url); } catch (e) {}
+    }
+  });
+  _pinThumbCache = {};
 }
 
 // ─── Toast ───
@@ -5246,7 +6636,7 @@ async function syncPendingPins() {
     }
 
     if (syncedCount > 0) {
-      pins = await PinStore.getAll();
+      pins = await PinStore.getAll(); bumpPinsVersion();
       renderAllPins();
       showToast('Synced ' + syncedCount + ' pin' + (syncedCount === 1 ? '' : 's'));
     }

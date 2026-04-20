@@ -6,7 +6,7 @@
 //   2. API calls (Overpass, USGS, MT)  — network-first, fall back to cache.
 //   3. App shell (html/css/js/icons)   — cache-first from flyangler-shell-v3.
 
-const SHELL_CACHE = 'flyangler-shell-v20';
+const SHELL_CACHE = 'flyangler-shell-v26';
 const TILES_CACHE = 'flyangler-tiles-v1';
 const KEEP_CACHES = [SHELL_CACHE, TILES_CACHE];
 
@@ -29,15 +29,37 @@ const SHELL_ASSETS = [
 ];
 
 self.addEventListener('install', function(event) {
-  event.waitUntil(
-    caches.open(SHELL_CACHE).then(function(cache) {
-      return Promise.all(SHELL_ASSETS.map(function(url) {
-        return cache.add(url).catch(function(err) {
-          console.log('SW cache add failed for', url, err);
-        });
-      }));
-    })
-  );
+  event.waitUntil((async function() {
+    var cache = await caches.open(SHELL_CACHE);
+    // Pre-cache all shell assets in parallel. Failures (e.g. a CDN blip on
+    // first install) are swallowed so the SW still activates — the
+    // opportunistic fetch handlers below will fill cache on later runs.
+    await Promise.all(SHELL_ASSETS.map(function(url) {
+      return cache.add(url).catch(function(err) {
+        console.log('SW cache add failed for', url, err);
+      });
+    }));
+    // Extra step: parse the Google Fonts CSS we just cached, extract the
+    // .woff2 URLs it references, and pre-cache THOSE too. Without this,
+    // fonts only get cached after the page renders them — which means
+    // a user who installs the SW online then immediately goes offline
+    // sees system-font fallbacks on the landing page until next online.
+    try {
+      var fontCssResp = await cache.match('https://fonts.googleapis.com/css2?family=Rye&family=Special+Elite&display=swap');
+      if (fontCssResp) {
+        var cssText = await fontCssResp.clone().text();
+        var urls = [];
+        var re = /url\((https:\/\/fonts\.gstatic\.com\/[^)]+)\)/g;
+        var m;
+        while ((m = re.exec(cssText)) !== null) {
+          urls.push(m[1].replace(/["']/g, ''));
+        }
+        await Promise.all(urls.map(function(u) {
+          return cache.add(u).catch(function() {});
+        }));
+      }
+    } catch (e) { /* non-fatal — fonts fall back to system */ }
+  })());
   self.skipWaiting();
 });
 
