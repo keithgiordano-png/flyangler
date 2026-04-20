@@ -1,0 +1,19 @@
+{
+  "name": "FlyAngler",
+  "short_name": "FlyAngler",
+  "description": "Log fly fishing spots, conditions, and public water access.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f7f5f0",
+  "theme_color": "#1a5632",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

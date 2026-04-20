@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>FlyAngler</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1a5632">
+<meta name="apple-mobile-web-app-title" content="FlyAngler">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- iOS prefers a 180x180 PNG for home-screen icons; SVG fallback for other agents -->
+<link rel="apple-touch-icon" href="apple-touch-icon.png" sizes="180x180">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Preconnect to data-source hostnames so the browser opens TCP/TLS
+     handshakes during page setup, not when the first fetch fires.
+     Saves ~100-300ms per host on cold page loads. -->
+<link rel="preconnect" href="https://overpass-api.de" crossorigin>
+<link rel="preconnect" href="https://overpass.kumi.systems" crossorigin>
+<link rel="preconnect" href="https://overpass.private.coffee" crossorigin>
+<link rel="preconnect" href="https://overpass.openstreetmap.fr" crossorigin>
+<link rel="preconnect" href="https://waterservices.usgs.gov" crossorigin>
+<link rel="preconnect" href="https://nominatim.openstreetmap.org" crossorigin>
+<link rel="preconnect" href="https://gisservicemt.gov" crossorigin>
+<link rel="preconnect" href="https://server.arcgisonline.com" crossorigin>
+<link rel="preconnect" href="https://a.basemaps.cartocdn.com" crossorigin>
+<link rel="preconnect" href="https://api.open-meteo.com" crossorigin>
+<link rel="preconnect" href="https://archive-api.open-meteo.com" crossorigin>
+<!-- Google Fonts for the Old West look -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rye&family=Special+Elite&display=swap">
+<link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+
+<!-- Landing page: shown on first paint, fades out to reveal the map -->
+<div id="landing-page" class="landing-page">
+  <div class="landing-inner">
+    <img class="landing-logo" src="Flyfishing%20logo.png" alt="Old West Fly Angler">
+    <h1 class="landing-title">FlyAngler</h1>
+    <p class="landing-tagline">Log every catch. Know every water.</p>
+    <p class="landing-credit">Powered by<br><span>Old West Outdoor Services</span></p>
+    <div class="landing-spinner"></div>
+    <p class="landing-skip">Tap to continue</p>
+  </div>
+</div>
+<script>
+  // Inline failsafe: dismiss the landing page even if app.js never loads
+  // (e.g., cached shell is incomplete offline). Both tap-to-dismiss and
+  // auto-dismiss live here so the user can ALWAYS get to the map.
+  (function() {
+    var dismissed = false;
+    function hide() {
+      if (dismissed) return;
+      dismissed = true;
+      var el = document.getElementById('landing-page');
+      if (el) el.classList.add('hidden');
+      // Expose so app.js can also call it (idempotent).
+      window.dismissLanding = hide;
+    }
+    window.dismissLanding = hide;
+    setTimeout(hide, 2500);
+    var el = document.getElementById('landing-page');
+    if (el) {
+      el.addEventListener('click', hide);
+      el.addEventListener('touchend', hide);
+    }
+  })();
+</script>
+
+<!-- Top Bar -->
+<div class="top-bar">
+  <h1><span>&#127907;</span> FlyAngler</h1>
+  <div class="top-bar-btns">
+    <button class="top-btn active" id="btn-street" onclick="setMapLayer('street')">Map</button>
+    <button class="top-btn" id="btn-satellite" onclick="setMapLayer('satellite')">Satellite</button>
+    <button class="top-btn" id="btn-search" onclick="openSearch()" title="Search places">&#128269;</button>
+    <button class="top-btn" id="btn-locate" onclick="locateUser()">&#128205;</button>
+  </div>
+</div>
+
+<!-- Offline banner -->
+<div id="offline-banner" class="offline-banner" hidden>
+  <span>📡</span> Offline — pins save locally and sync when you reconnect
+</div>
+
+<!-- Active fishing session indicator (only visible while recording) -->
+<div id="session-pill" class="session-pill" hidden onclick="toggleFishingSession()"></div>
+
+<!-- Session report card (shown after a session ends) -->
+<div id="session-report" class="session-report-wrap" hidden></div>
+
+<!-- Search overlay -->
+<div id="search-overlay" hidden>
+  <div class="search-bar">
+    <span class="search-icon-left">&#128269;</span>
+    <input type="text" id="search-input" placeholder="Search town, river, or lake…" autocomplete="off" autocorrect="off" autocapitalize="words" spellcheck="false" oninput="onSearchInput(event)" onkeydown="onSearchKey(event)">
+    <button class="search-close" onclick="closeSearch()" aria-label="Close search">&times;</button>
+  </div>
+  <div id="search-results" class="search-results"></div>
+  <div id="search-hint" class="search-hint">Try a town name (e.g., "Bozeman") or a river ("Madison River").</div>
+</div>
+
+<!-- Pin mode banner -->
+<div class="pin-mode-banner" id="pin-banner">Tap anywhere on the map to drop a pin</div>
+
+<!-- Map -->
+<div id="map"></div>
+
+<!-- Custom zoom controls -->
+<div class="zoom-controls">
+  <button class="zoom-btn" id="zoom-in-btn" onclick="if(map)map.zoomIn()" title="Zoom in" aria-label="Zoom in">+</button>
+  <button class="zoom-btn" id="zoom-out-btn" onclick="if(map)map.zoomOut()" title="Zoom out" aria-label="Zoom out">&#8722;</button>
+</div>
+
+<!-- Land data loading indicator -->
+<div class="land-loading" id="land-loading"><div class="spinner"></div>Loading land data...</div>
+
+<!-- Legend (collapsible) -->
+<div class="legend" id="legend">
+  <button class="legend-toggle" onclick="toggleLegend()" aria-label="Toggle legend">
+    <span id="legend-toggle-icon">&#9432;</span><span id="legend-toggle-text"> Legend</span>
+  </button>
+  <div class="legend-items" id="legend-items">
+    <div class="legend-item"><div class="legend-swatch" style="background:rgba(34,139,34,0.4)"></div> Public Land</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#1e6fa0; height:3px; border-radius:2px;"></div> River / Stream</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#2563eb"></div> Fishing Access</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#0891b2"></div> Boat Launch</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#d97706"></div> Campground</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--accent)"></div> Your Pins</div>
+  </div>
+</div>
+
+<!-- Photo-import FAB (smaller, above main pin FAB). Reuses the hidden
+     photo-import-input from the My Pins modal so there's only one EXIF
+     pipeline to maintain. -->
+<button class="fab fab-camera" id="fab-photo"
+        onclick="document.getElementById('photo-import-input').click()"
+        title="Import from photo" aria-label="Import from photo">
+  <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+    <circle cx="12" cy="13" r="4"/>
+  </svg>
+</button>
+
+<!-- FAB (Add Pin) -->
+<button class="fab" id="fab-add" onclick="startAddPin()" title="Drop a pin">+</button>
+
+<!-- Bottom Nav -->
+<div class="bottom-nav">
+  <button class="nav-item active" id="nav-map" onclick="showTab('map')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg>
+    Map
+  </button>
+  <button class="nav-item" id="nav-pins" onclick="showTab('pins')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+    My Pins
+  </button>
+  <button class="nav-item" id="nav-journal" onclick="showTab('journal')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>
+    Journal
+  </button>
+  <button class="nav-item" id="nav-review" onclick="showTab('review')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+    Review<span id="review-badge" class="nav-badge" hidden></span>
+  </button>
+  <button class="nav-item nav-item-icon-only" id="nav-reports" onclick="showTab('reports')" title="Reports" aria-label="Reports">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+  </button>
+  <button class="nav-item" id="nav-settings" onclick="showTab('settings')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    Settings
+  </button>
+</div>
+
+<!-- Toast notification -->
+<div class="toast" id="toast"></div>
+
+<!-- Merge-or-new prompt: shown when dropping a pin within ~100yd of an existing one -->
+<div id="merge-prompt" class="merge-prompt-overlay" hidden>
+  <div class="merge-prompt-card">
+    <h3 class="merge-prompt-title">You've fished near here before</h3>
+    <div class="merge-prompt-body"></div>
+    <div class="merge-prompt-actions">
+      <button type="button" class="btn btn-primary merge-btn-merge">Add this catch to the existing pin</button>
+      <button type="button" class="btn merge-btn-new" style="background:#e5e5e5; color:var(--text)">Create a separate pin here</button>
+      <button type="button" class="btn btn-danger merge-btn-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Pin Editor -->
+<div class="modal-overlay" id="modal-pin">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <h2 id="pin-modal-title">
+      &#128204; New Pin
+      <button class="modal-close" onclick="closeModal('modal-pin')">&times;</button>
+    </h2>
+
+    <!-- Offline reassurance (shown when no cell signal) -->
+    <div id="pin-offline-note" class="pin-offline-note" hidden>
+      <b>Offline</b> &mdash; save now, river &amp; conditions will auto-fill when you reconnect.
+    </div>
+
+    <!-- "What worked here before" — past-catch recall for this location -->
+    <div id="pin-history" class="pin-history" hidden></div>
+
+    <!-- Regulation & USGS links (populated dynamically) -->
+    <div class="link-bar" id="pin-links" style="display:none">
+      <a id="link-regs" href="#" target="_blank">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        <span id="link-regs-text">Fishing Regulations for this River</span>
+      </a>
+      <a id="link-usgs" href="#" target="_blank">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        <span id="link-usgs-text">USGS River Flow Data</span>
+      </a>
+    </div>
+
+    <!-- Flow badge -->
+    <div id="pin-flow-badge" style="margin-bottom:8px; display:none">
+      <div class="flow-badge">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        <span id="pin-flow-value">-- CFS</span>
+      </div>
+    </div>
+
+    <!-- Flow history sparkline (7-day trend) — populated when a USGS site is found -->
+    <div id="pin-flow-spark" class="pin-flow-spark"></div>
+
+    <!-- Water temperature badge (traffic-light colored) -->
+    <div id="pin-temp-badge" class="temp-badge-wrap" style="margin-bottom:12px; display:none">
+      <div class="temp-badge">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
+        <span id="pin-temp-value">--°F water</span>
+      </div>
+    </div>
+
+    <!-- Weather forecast (current + 3 days) -->
+    <div id="pin-weather" class="pin-weather-wrap"></div>
+
+    <!-- Parcel / stream-access-law info block -->
+    <div id="pin-parcel-info" class="pin-parcel-info unknown"></div>
+
+    <div class="field">
+      <label class="required">Pin Name</label>
+      <input type="text" id="pin-name" placeholder="e.g., Big Brown Hole, Evening Rise Spot">
+    </div>
+
+    <div class="field-row">
+      <div class="field">
+        <label>Date</label>
+        <input type="date" id="pin-date">
+      </div>
+      <div class="field">
+        <label>Time</label>
+        <input type="time" id="pin-time">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>River</label>
+      <div class="river-combo">
+        <select id="pin-river-select" onchange="onRiverSelectChange()">
+          <option value="">Detecting nearby rivers...</option>
+        </select>
+        <input type="text" id="pin-river-custom" placeholder="Type river name" style="display:none">
+      </div>
+      <input type="hidden" id="pin-river" value="">
+    </div>
+
+    <!-- Catches list: one entry per fish caught at this spot. Multi-catch
+         means a single pin can hold several fish from the same location. -->
+    <div class="field">
+      <label>Catches</label>
+      <div id="pin-catches-list" class="pin-catches-list"></div>
+      <button type="button" class="btn-add-catch" onclick="addCatchRow()">+ Add another catch</button>
+    </div>
+
+    <div class="photo-upload">
+      <label>Photos</label>
+      <div id="photo-container"></div>
+      <div class="photo-add" id="photo-add-btn">+</div>
+      <input type="file" accept="image/*" multiple style="display:none" id="photo-input" onchange="handlePhotos(this)">
+    </div>
+
+    <div class="field">
+      <label>Notes</label>
+      <textarea id="pin-notes" placeholder="Water conditions, hatch activity, techniques that worked..."></textarea>
+    </div>
+
+    <input type="hidden" id="pin-id">
+    <input type="hidden" id="pin-lat">
+    <input type="hidden" id="pin-lng">
+
+    <button class="btn btn-primary" onclick="savePin()">Save Pin</button>
+    <button class="btn btn-danger" id="btn-delete-pin" style="display:none" onclick="deletePin()">Delete Pin</button>
+  </div>
+</div>
+
+<!-- Modal: Pin List -->
+<div class="modal-overlay" id="modal-pins">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <h2>&#128204; My Pins <button class="modal-close" onclick="closeModal('modal-pins')">&times;</button></h2>
+
+    <!-- Photo-first imports — single opens the pin editor, bulk processes many silently -->
+    <div class="import-btn-row">
+      <label for="photo-import-input" class="btn btn-primary">
+        &#128247; Import one photo
+      </label>
+      <label for="photo-bulk-input" class="btn btn-primary" style="background:#2d6a4f">
+        &#128248; Bulk import
+      </label>
+    </div>
+    <!-- accept=image/* so iPhone HEIC/HEIF photos also show up. iOS auto-converts
+         HEIC to JPEG when exporting through the file input, so our EXIF parser
+         still works. Raw HEIC falls through gracefully to pin-at-map-center. -->
+    <input type="file" accept="image/*" style="display:none" id="photo-import-input" onchange="importFromPhoto(this)">
+    <input type="file" accept="image/*" multiple style="display:none" id="photo-bulk-input" onchange="bulkImportPhotos(this)">
+    <div style="font-size:11px; color:var(--muted); margin-bottom:12px; margin-top:6px;">
+      Single photo opens the pin editor. Bulk import silently creates pins for many photos at once,
+      groups photos within 100 yd into the same pin, then sends any missing-fly catches to the Review tab.
+    </div>
+
+    <div id="pin-list-content"></div>
+  </div>
+</div>
+
+<!-- Modal: Settings -->
+<div class="modal-overlay" id="modal-settings">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <h2>Settings <button class="modal-close" onclick="closeModal('modal-settings')">&times;</button></h2>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Custom Fish Types</div>
+        <div class="setting-desc">Add your own species to the dropdown</div>
+        <div style="display:flex; gap:6px; margin-top:8px;">
+          <input type="text" id="new-fish-type" placeholder="e.g., Cutthroat Trout" style="flex:1; padding:10px 12px; border:1px solid #d4d4d4; border-radius:10px; font-size:16px;">
+          <button class="btn btn-primary" style="width:auto; padding:8px 16px;" onclick="addFishType()">Add</button>
+        </div>
+        <div class="chip-group" id="fish-chips"></div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Map Layer</div>
+        <div class="setting-desc">Choose default map view</div>
+        <div class="chip-group" style="margin-top:8px;">
+          <span class="chip active" id="chip-street" onclick="setMapLayer('street')">Street Map</span>
+          <span class="chip" id="chip-satellite" onclick="setMapLayer('satellite')">Satellite</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div style="width:100%">
+        <div class="setting-label">Pin Editor Sections</div>
+        <div class="setting-desc">Uncheck any info block you'd rather not see on the pin screen.</div>
+        <div id="pin-sections-settings" class="pin-sections-settings" style="margin-top:10px;"></div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Fishing Session Tracking</div>
+        <div class="setting-desc">
+          Opt-in. Start a session before fishing and the app records your
+          walk + associates pins dropped during the session. Generates a
+          trip report when you end it.
+        </div>
+        <div class="chip-group" style="margin-top:8px;">
+          <span class="chip" id="chip-session-on" onclick="setSessionTrackingEnabled(true)">Enabled</span>
+          <span class="chip active" id="chip-session-off" onclick="setSessionTrackingEnabled(false)">Disabled</span>
+        </div>
+        <button id="session-start-btn" class="btn btn-primary" style="margin-top:10px; display:none;" onclick="toggleFishingSession()">
+          Start a Session
+        </button>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Show Public Land Overlay</div>
+        <div class="setting-desc">Shade federal / state protected land. <b>Off by default</b> because the query is heavy — turning on slows map loading.</div>
+        <div class="chip-group" style="margin-top:8px;">
+          <span class="chip" id="chip-prop-on" onclick="toggleProperty(true)">On</span>
+          <span class="chip active" id="chip-prop-off" onclick="toggleProperty(false)">Off</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Interactive River Info</div>
+        <div class="setting-desc">
+          Clickable blue river lines with flow + access popups. <b>Off by default</b>
+          because it competes for Overpass capacity and slows POI loading.
+          Rivers stay visible on the base map either way — this only toggles
+          the tap-for-info overlay. For per-river info, drop a pin on the river.
+        </div>
+        <div class="chip-group" style="margin-top:8px;">
+          <span class="chip" id="chip-rivers-on" onclick="toggleRivers(true)">On</span>
+          <span class="chip active" id="chip-rivers-off" onclick="toggleRivers(false)">Off</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Points of Interest</div>
+        <div class="setting-desc">Show fishing access, boat launches, campgrounds</div>
+        <div class="chip-group" style="margin-top:8px;">
+          <span class="chip active" id="chip-poi-on" onclick="togglePOIs(true)">On</span>
+          <span class="chip" id="chip-poi-off" onclick="togglePOIs(false)">Off</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div style="width:100%">
+        <div class="setting-label">Offline Map Regions</div>
+        <div class="setting-desc">Download tiles so the map renders without cell signal</div>
+        <button class="btn btn-primary" style="margin-top:8px" onclick="openDownloadModal()">+ Download This View</button>
+        <div id="region-list" style="margin-top:10px"></div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div style="width:100%">
+        <div class="setting-label">About FlyAngler</div>
+        <div class="setting-desc" style="margin-top:4px;">Version 0.2 Prototype. Built for fly anglers who want to log their favorite spots, track conditions, and find public water access. Data: USGS Water Services, PAD-US (Protected Areas Database), ESRI basemaps, state fish & wildlife agencies.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Reports — filter catches by river + conditions, see matching records -->
+<div class="modal-overlay" id="modal-reports">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <h2>&#128202; Reports <button class="modal-close" onclick="closeModal('modal-reports')">&times;</button></h2>
+
+    <div class="report-filters">
+      <div class="field">
+        <label>River</label>
+        <select id="rep-river" onchange="renderReports()"></select>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label>Flow Rate</label>
+          <select id="rep-flow" onchange="renderReports()"></select>
+        </div>
+        <div class="field">
+          <label>Water Temp</label>
+          <select id="rep-water" onchange="renderReports()"></select>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label>Air Temp</label>
+          <select id="rep-air" onchange="renderReports()"></select>
+        </div>
+        <div class="field">
+          <label>Weather</label>
+          <select id="rep-weather" onchange="renderReports()"></select>
+        </div>
+      </div>
+
+      <button type="button" class="btn report-reset-btn" onclick="resetReportFilters()">Reset filters</button>
+    </div>
+
+    <div id="report-summary" class="report-summary"></div>
+    <div id="report-results"></div>
+  </div>
+</div>
+
+<!-- Modal: Review — surfaces pins with catches missing fly info for bulk completion -->
+<div class="modal-overlay" id="modal-review">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <h2>&#9989; Review <button class="modal-close" onclick="closeModal('modal-review')">&times;</button></h2>
+    <p style="font-size:12px; color:var(--muted); margin-top:-8px; margin-bottom:12px;">
+      Pins with one or more catches missing a fly. Tap a pin to fill in the details;
+      once every catch has a fly logged, it leaves this list automatically.
+    </p>
+    <div id="review-content"></div>
+  </div>
+</div>
+
+<!-- Modal: Catch Journal / Stats dashboard -->
+<div class="modal-overlay" id="modal-journal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <h2>&#128202; Catch Journal <button class="modal-close" onclick="closeModal('modal-journal')">&times;</button></h2>
+    <div id="journal-content"></div>
+  </div>
+</div>
+
+<!-- Modal: Download Offline Region -->
+<div class="modal-overlay" id="modal-download">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <h2>&#128229; Download Map Region <button class="modal-close" onclick="closeDownloadModal()">&times;</button></h2>
+
+    <!-- Setup view -->
+    <div id="dl-setup">
+      <div class="field">
+        <label class="required">Region Name</label>
+        <input type="text" id="dl-name" placeholder="e.g., Henry's Fork Trip">
+      </div>
+
+      <div class="field">
+        <label>Detail Level</label>
+        <div id="dl-presets">
+          <label class="preset-radio" data-preset="overview">
+            <span>
+              <input type="radio" name="dl-preset" value="overview"> <b>Overview only</b>
+              <div style="font-size:11px; color:var(--muted); margin-top:2px;">Wide area, low detail</div>
+            </span>
+            <span class="preset-size" id="dl-size-overview">—</span>
+          </label>
+          <label class="preset-radio selected" data-preset="detailed">
+            <span>
+              <input type="radio" name="dl-preset" value="detailed" checked> <b>Detailed</b>
+              <div style="font-size:11px; color:var(--muted); margin-top:2px;">Recommended for trips</div>
+            </span>
+            <span class="preset-size" id="dl-size-detailed">—</span>
+          </label>
+          <label class="preset-radio" data-preset="max">
+            <span>
+              <input type="radio" name="dl-preset" value="max"> <b>Max detail</b>
+              <div style="font-size:11px; color:var(--muted); margin-top:2px;">Large download, street-level</div>
+            </span>
+            <span class="preset-size" id="dl-size-max">—</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Layer</label>
+        <select id="dl-layer">
+          <option value="street">Street Map</option>
+          <option value="satellite">Satellite</option>
+        </select>
+      </div>
+
+      <div class="field-info" id="dl-bbox-info">Current view: —</div>
+      <div class="field-info" id="dl-quota-warn" style="color:var(--danger); display:none"></div>
+
+      <div class="btn-row">
+        <button class="btn" style="background:#e5e5e5; color:var(--text)" onclick="closeDownloadModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="confirmDownload()">Download</button>
+      </div>
+    </div>
+
+    <!-- Progress view -->
+    <div id="dl-progress" style="display:none">
+      <h3 id="dl-progress-title" style="font-size:15px; margin-bottom:10px">Downloading tiles…</h3>
+      <div class="progress-wrap">
+        <div class="progress-bar"><div class="progress-fill" id="dl-progress-fill" style="width:0%"></div></div>
+        <div class="progress-text" id="dl-progress-text">0 / 0</div>
+      </div>
+      <button class="btn btn-danger" id="dl-cancel-btn" onclick="cancelDownload()">Cancel</button>
+    </div>
+
+    <!-- Done view -->
+    <div id="dl-done" style="display:none">
+      <div id="dl-done-summary" style="padding:12px 0; font-size:14px; line-height:1.5;"></div>
+      <button class="btn btn-primary" onclick="closeDownloadModal()">OK</button>
+    </div>
+  </div>
+</div>
+
+<script src="db.js"></script>
+<script src="tiles.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

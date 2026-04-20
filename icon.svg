@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Background: brand green -->
+  <rect width="512" height="512" rx="96" fill="#1a5632"/>
+  <!-- Stylized fish silhouette in accent gold -->
+  <g fill="#e8a840">
+    <!-- Fish body -->
+    <path d="M120 256
+             Q180 160 300 160
+             Q380 160 420 220
+             L460 200
+             L440 256
+             L460 312
+             L420 292
+             Q380 352 300 352
+             Q180 352 120 256 Z"/>
+    <!-- Eye -->
+    <circle cx="180" cy="240" r="10" fill="#1a5632"/>
+    <!-- Tail fin detail -->
+    <path d="M120 256 L70 200 L90 256 L70 312 Z"/>
+  </g>
+  <!-- Hook -->
+  <g fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round">
+    <path d="M260 120 L260 200 Q260 240 300 240 Q330 240 330 215"/>
+    <circle cx="260" cy="110" r="6" fill="#fff"/>
+  </g>
+</svg>
